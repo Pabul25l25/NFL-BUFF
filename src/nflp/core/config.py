@@ -101,6 +101,33 @@ class PropsConfig(BaseModel):
     usage_window: int = 5
 
 
+class SyncConfig(BaseModel):
+    """Publicación de un subconjunto de la base local a una nube alcanzable
+    desde internet (Neon/Postgres), para que el frontend en Vercel pueda leer
+    predicciones sin acceso a ``D:\\NFL\\data\\nflp.duckdb``.
+
+    Deshabilitado por defecto: sin ``postgres_url`` configurada, `publish_all()`
+    no hace nada. Ver `src/nflp/sync/publish.py` y `docs/arquitectura.md`.
+    """
+
+    enabled: bool = False
+    # Cadena de conexión con rol de ESCRITURA. La de solo lectura (para Vercel)
+    # se configura aparte, directamente en el proyecto de Vercel — nunca vive
+    # en esta configuración local.
+    postgres_url: str = ""
+    # Tablas que se replican tal cual (sin transformar), con mode="replace".
+    tables_replace: list[str] = Field(
+        default_factory=lambda: [
+            "teams", "stadiums", "model_registry", "backtest_results",
+            "calibration_bins", "drift_metrics", "retraining_log",
+            "production_performance",
+        ]
+    )
+    # Cuántas temporadas recientes de player_stats_weekly/weather sincronizar
+    # (el frontend nunca necesita comparar props de hace 10 años).
+    recent_seasons: int = 3
+
+
 class BacktestConfig(BaseModel):
     start_season: int = 2015
     end_season: int = 2025
@@ -141,6 +168,7 @@ class Settings(BaseModel):
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     modeling: ModelingConfig = Field(default_factory=ModelingConfig)
     props: PropsConfig = Field(default_factory=PropsConfig)
+    sync: SyncConfig = Field(default_factory=SyncConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     mlflow: MLflowConfig = Field(default_factory=MLflowConfig)

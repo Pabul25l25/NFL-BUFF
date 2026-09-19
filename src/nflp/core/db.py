@@ -13,6 +13,7 @@ consultas; las diferencias inevitables se aíslan aquí.
 from __future__ import annotations
 
 import threading
+import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,6 +23,34 @@ import pandas as pd
 
 from nflp.core.config import Settings, get_settings
 from nflp.core.logging import get_logger
+
+
+def _normalize_postgres_url(url: str) -> str:
+    """Fuerza el dialecto ``psycopg`` (v3) en cualquier cadena de conexión.
+
+    El proyecto depende de `psycopg[binary]` (v3), pero los proveedores de
+    Postgres (Neon incluido) entregan cadenas con el prefijo genérico
+    ``postgresql://``, que SQLAlchemy resuelve por defecto al dialecto
+    `psycopg2` — no instalado aquí, y produce un `ModuleNotFoundError` confuso.
+    Se normaliza el prefijo para que cualquier cadena copiada tal cual del
+    proveedor funcione sin que haya que acordarse de añadir `+psycopg`.
+    """
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url[len("postgresql://") :]
+    if url.startswith("postgres://"):  # alias corto que usan algunos proveedores
+        return "postgresql+psycopg://" + url[len("postgres://") :]
+    return url
+
+
+# PostgreSQL admite como máximo 65.535 parámetros por sentencia. `df.to_sql`
+# con `method="multi"` los agota fácil en tablas anchas o con muchas filas
+# (``ncols`` × ``chunksize`` filas por lote) si no se limita explícitamente.
+_POSTGRES_MAX_PARAMS = 65_535
+
+
+def _safe_chunksize(n_columns: int) -> int:
+    """Filas por lote que mantienen el envío bien por debajo del límite."""
+    return max(1, (_POSTGRES_MAX_PARAMS // 2) // max(n_columns, 1))
 
 log = get_logger(__name__)
 
@@ -65,7 +94,7 @@ class Database:
         else:
             from sqlalchemy import create_engine
 
-            engine = create_engine(self.settings.database.postgres_url)
+            engine = create_engine(_normalize_postgres_url(self.settings.database.postgres_url))
             conn = engine.connect()
             try:
                 yield conn
@@ -99,13 +128,20 @@ class Database:
         return None if pd.isna(value) else value
 
     def table_exists(self, table: str) -> bool:
+        if self.backend != "duckdb":
+            # Estilo de parámetro propio de SQLAlchemy (`:t`), no el `%(t)s` de
+            # psycopg2 a mano: `text()` lo traduce él mismo al paramstyle real
+            # del driver activo (psycopg v3 aquí). Escribir `%(t)s` directamente
+            # deja pasar un `%` literal que el driver no sabe interpretar.
+            sql = (
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_name = :t AND table_schema NOT IN ('pg_catalog','information_schema')"
+            )
+            return bool(self.scalar(sql, {"t": table}))  # type: ignore[arg-type]
         sql = (
             "SELECT count(*) FROM information_schema.tables "
             "WHERE table_name = ? AND table_schema NOT IN ('pg_catalog','information_schema')"
         )
-        if self.backend != "duckdb":
-            sql = sql.replace("?", "%(t)s")
-            return bool(self.scalar(sql, {"t": table}))  # type: ignore[arg-type]
         return bool(self.scalar(sql, [table]))
 
     def row_count(self, table: str) -> int:
@@ -197,20 +233,39 @@ class Database:
                 if mode == "replace":
                     conn.execute(text(f"DELETE FROM {table}"))
                 elif mode == "upsert":
+                    # Tabla temporal + DELETE por subconsulta: el mismo patrón
+                    # que ya usa el backend DuckDB (`register` + `IN (SELECT
+                    # ... FROM _staging_df)`). La versión anterior armaba una
+                    # cláusula OR con un parámetro nombrado POR FILA — con
+                    # tablas de miles de filas (`games`, `player_stats_weekly`)
+                    # eso supera el límite de 65.535 parámetros por sentencia
+                    # de Postgres y la conexión simplemente se cae a mitad de
+                    # envío. Nunca se notó contra DuckDB porque ese backend usa
+                    # una ruta completamente distinta.
                     keys = list(key_columns)  # type: ignore[arg-type]
-                    tuples = df[keys].drop_duplicates().itertuples(index=False, name=None)
-                    clause = " OR ".join(
-                        "(" + " AND ".join(f"{k} = :{k}_{i}" for k in keys) + ")"
-                        for i, _ in enumerate(df[keys].drop_duplicates().itertuples())
+                    key_frame = df[keys].drop_duplicates()
+                    staging = f"_upsert_keys_{uuid.uuid4().hex[:8]}"
+                    key_frame.to_sql(
+                        staging, conn, if_exists="replace", index=False,
+                        method="multi", chunksize=_safe_chunksize(len(keys)),
                     )
-                    params = {
-                        f"{k}_{i}": v
-                        for i, row in enumerate(tuples)
-                        for k, v in zip(keys, row, strict=True)
-                    }
-                    if clause:
-                        conn.execute(text(f"DELETE FROM {table} WHERE {clause}"), params)
-                df.to_sql(table, conn, if_exists="append", index=False, method="multi")
+                    keys_sql = ", ".join(keys)
+                    try:
+                        conn.execute(
+                            text(
+                                f"DELETE FROM {table} WHERE ({keys_sql}) IN "
+                                f"(SELECT {keys_sql} FROM {staging})"
+                            )
+                        )
+                    finally:
+                        # Se limpia pase lo que pase: dejar una tabla de
+                        # apoyo huérfana en Neon es peor que un DELETE fallido
+                        # y visible en el log.
+                        conn.execute(text(f"DROP TABLE IF EXISTS {staging}"))
+                df.to_sql(
+                    table, conn, if_exists="append", index=False,
+                    method="multi", chunksize=_safe_chunksize(len(df.columns)),
+                )
                 conn.commit()
 
         log.debug("Escritas %d filas en %s (modo=%s).", len(df), table, mode)
@@ -228,20 +283,50 @@ class Database:
 
 
 def _split_statements(script: str) -> list[str]:
-    """Divide un script SQL en sentencias, ignorando ``;`` dentro de literales."""
+    """Divide un script SQL en sentencias, ignorando ``;`` dentro de literales
+    o de comentarios ``-- ...``.
+
+    **Bug real que motivó el segundo caso**: varios comentarios de las
+    migraciones contienen un punto y coma dentro del propio texto (p. ej.
+    "no supervisado; feature auxiliar"). Sin reconocer el comentario, ese `;`
+    se interpretaba como fin de sentencia y partía un `CREATE TABLE` a la
+    mitad — invisible contra DuckDB (que ejecuta el script entero de una vez,
+    sin pasar por esta función) y solo se manifestó al aplicar las mismas
+    migraciones contra Postgres/Neon por primera vez.
+    """
     statements: list[str] = []
     buffer: list[str] = []
     in_string = False
-    for char in script:
+    in_comment = False
+    chars = script
+    i = 0
+    while i < len(chars):
+        char = chars[i]
+        if in_comment:
+            buffer.append(char)
+            if char == "\n":
+                in_comment = False
+            i += 1
+            continue
         if char == "'":
             in_string = not in_string
+            buffer.append(char)
+            i += 1
+            continue
+        if not in_string and char == "-" and i + 1 < len(chars) and chars[i + 1] == "-":
+            in_comment = True
+            buffer.append(char)
+            i += 1
+            continue
         if char == ";" and not in_string:
             statement = "".join(buffer).strip()
             if statement:
                 statements.append(statement)
             buffer = []
-        else:
-            buffer.append(char)
+            i += 1
+            continue
+        buffer.append(char)
+        i += 1
     tail = "".join(buffer).strip()
     if tail:
         statements.append(tail)

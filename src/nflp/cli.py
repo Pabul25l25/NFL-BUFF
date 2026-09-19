@@ -43,6 +43,10 @@ model_app = typer.Typer(name="model", help="Modeling Agent — entrenamiento y v
 backtest_app = typer.Typer(name="backtest", help="Backtesting Agent — walk-forward.", no_args_is_help=True)
 monitor_app = typer.Typer(name="monitor", help="Monitoring Agent — drift y promoción.", no_args_is_help=True)
 pipeline_app = typer.Typer(name="pipeline", help="Orquestador — flows de Prefect.", no_args_is_help=True)
+publish_app = typer.Typer(
+    name="publish", help="Publica un subconjunto de datos hacia Neon para el frontend web.",
+    no_args_is_help=True,
+)
 
 app.add_typer(db_app)
 app.add_typer(data_app)
@@ -52,6 +56,7 @@ app.add_typer(model_app)
 app.add_typer(backtest_app)
 app.add_typer(monitor_app)
 app.add_typer(pipeline_app)
+app.add_typer(publish_app)
 
 
 @app.callback()
@@ -717,6 +722,43 @@ def pipeline_full(
 
     full_pipeline(seasons=_parse_seasons(seasons) if seasons else None, tune=tune)
     console.print("[green]Pipeline completo terminado.[/green]")
+
+
+# =============================================================================
+# publish
+# =============================================================================
+
+
+@publish_app.command("run")
+def publish_run() -> None:
+    """Publica el subconjunto configurado de tablas a Neon.
+
+    Sin efecto si `NFLP_SYNC__ENABLED` no está en `true` o falta
+    `NFLP_SYNC__POSTGRES_URL` — pensado para probar la sincronización sola,
+    sin correr todo `nflp pipeline weekly`.
+    """
+    from nflp.sync import publish_all
+
+    report = publish_all()
+
+    if report.skipped:
+        console.print(
+            "[yellow]Publicación desactivada. Configura NFLP_SYNC__ENABLED=true "
+            "y NFLP_SYNC__POSTGRES_URL antes de correr esto.[/yellow]"
+        )
+        raise typer.Exit(code=1)
+
+    if report.error:
+        console.print(f"[red]Publicación interrumpida: {report.error}[/red]")
+        raise typer.Exit(code=1)
+
+    table = Table(title="Publicado a Neon", header_style="bold cyan")
+    table.add_column("Tabla")
+    table.add_column("Filas", justify="right")
+    for name, rows in report.tables.items():
+        table.add_row(name, f"{rows:,}")
+    console.print(table)
+    console.print(f"[green]Total: {report.total():,} filas en {len(report.tables)} tablas.[/green]")
 
 
 # =============================================================================

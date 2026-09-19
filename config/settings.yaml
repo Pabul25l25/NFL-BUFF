@@ -69,6 +69,20 @@ props:
   # Semanas de histórico usadas en la proyección de uso.
   usage_window: 5
 
+sync:
+  # Publica un subconjunto de datos a Neon/Postgres para el frontend en Vercel
+  # (que no puede leer data/nflp.duckdb, al vivir en tu red local). Apagado
+  # por defecto: sin postgres_url no se publica nada.
+  # Actívalo con NFLP_SYNC__ENABLED=true y NFLP_SYNC__POSTGRES_URL=<cadena con
+  # rol de ESCRITURA de Neon> — nunca la de solo lectura, esa va en Vercel.
+  enabled: false
+  postgres_url: ""
+  tables_replace: [teams, stadiums, model_registry, backtest_results,
+                   calibration_bins, drift_metrics, retraining_log,
+                   production_performance]
+  # Temporadas recientes de player_stats_weekly/weather a sincronizar.
+  recent_seasons: 3
+
 backtest:
   # Walk-forward: primera temporada evaluada (las anteriores son solo entrenamiento).
   start_season: 2015

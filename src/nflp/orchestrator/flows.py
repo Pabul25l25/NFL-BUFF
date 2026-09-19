@@ -7,9 +7,11 @@ observabilidad y programación, pero no es un requisito para que nada funcione.
 Flows disponibles:
 
 * ``weekly_flow`` — **el comando semanal único**: ingesta, features, reentrena,
-  promueve si corresponde y predice, para partidos y para props. Pensado para
-  correr los martes, cuando ya se han cerrado los partidos del fin de semana y
-  se publican los primeros partes de lesiones de la semana siguiente.
+  promueve si corresponde, predice (partidos y props) y, por último, publica un
+  subconjunto a Neon para el frontend en Vercel (`src/nflp/sync/publish.py`).
+  Pensado para correr los martes, cuando ya se han cerrado los partidos del fin
+  de semana y se publican los primeros partes de lesiones de la semana
+  siguiente.
 * ``retrain_flow`` — solo reentrenamiento con gate de promoción (sin ingesta ni
   predicción), para cuando ya tienes los datos al día y solo quieres reentrenar.
 * ``backtest_flow`` — validación walk-forward completa.
@@ -201,6 +203,35 @@ def monitor_task(targets: list[str] | None = None) -> dict[str, Any]:
     return results
 
 
+@task(name="publicar", retries=2, retry_delay_seconds=30)
+def publish_task() -> dict[str, Any]:
+    """Publica el subconjunto de datos hacia Neon, para el frontend en Vercel.
+
+    Deliberadamente indulgente con los fallos: si Neon no está configurado o
+    está caído, se registra el problema pero **no se relanza la excepción**.
+    Es el último paso del ciclo semanal — las predicciones locales y el
+    Streamlit ya generados no deben depender de que internet o un servicio de
+    terceros estén disponibles en ese instante.
+    """
+    from nflp.sync import publish_all
+
+    logger = get_run_logger()
+    try:
+        report = publish_all()
+    except Exception as exc:  # noqa: BLE001 - ver docstring
+        logger.warning("Publicación a la nube falló, se ignora: %s", exc)
+        return {"skipped": True, "error": str(exc)}
+
+    if report.skipped:
+        logger.info("Publicación a la nube desactivada (NFLP_SYNC__ENABLED=false).")
+    elif report.error:
+        logger.warning("Publicación a la nube incompleta: %s", report.error)
+    else:
+        logger.info("Publicado a la nube: %d tablas, %d filas.", len(report.tables), report.total())
+
+    return {"skipped": report.skipped, "error": report.error, "tables": report.tables}
+
+
 # ================================================================== flows
 
 
@@ -258,8 +289,14 @@ def weekly_flow(season: int | None = None, week: int | None = None) -> dict[str,
     for prop in settings.props.targets:
         predictions[prop] = predict_props_task(prop, season, week)
 
+    # --- 7. publicación a la nube (opcional, para el frontend en Vercel) ---
+    publishing = publish_task()
+
     logger.info("Ciclo semanal completado.")
-    return {"entrenamiento": training, "monitoreo": monitoring, "predicciones": predictions}
+    return {
+        "entrenamiento": training, "monitoreo": monitoring,
+        "predicciones": predictions, "publicacion": publishing,
+    }
 
 
 @flow(name="nflp-reentrenamiento", description="Reentrenamiento con gate de promoción.")
