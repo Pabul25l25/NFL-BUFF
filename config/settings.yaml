@@ -1,0 +1,101 @@
+# Configuración principal de NFL-Predictor.
+# Todos los valores pueden sobrescribirse con variables de entorno con prefijo NFLP_
+# (anidadas con doble guion bajo, p. ej. NFLP_BACKTEST__START_SEASON=2018).
+
+paths:
+  data_dir: data
+  raw_dir: data/raw
+  artifacts_dir: data/artifacts
+  reports_dir: data/reports
+  duckdb_path: data/nflp.duckdb
+
+database:
+  # "duckdb" (por defecto, analítica local) o "postgresql"
+  backend: duckdb
+  # URL solo usada cuando backend == postgresql
+  postgres_url: postgresql+psycopg://nflp:nflp@localhost:5432/nflp
+
+ingestion:
+  # Temporadas a ingerir. nflverse cubre 1999-2026.
+  # Arrancamos en 2011: desde ahí el dato de participación/snaps es fiable.
+  start_season: 2011
+  end_season: 2026
+  # Caché en disco de los parquet de nflverse, validada por ETag.
+  cache_enabled: true
+  # Segundos entre peticiones a una misma fuente (cortesía + rate limit).
+  request_delay_seconds: 0.5
+  max_retries: 5
+  timeout_seconds: 60
+
+weather:
+  # Open-Meteo no requiere API key. Archivo para histórico, forecast para futuro.
+  archive_url: https://archive-api.open-meteo.com/v1/archive
+  forecast_url: https://api.open-meteo.com/v1/forecast
+  # Máximo de estadios por petición agrupada.
+  batch_size: 10
+  request_delay_seconds: 1.0
+
+features:
+  # Versión del conjunto de features. Cambiarla invalida el feature store.
+  version: v1
+  # Ventanas de medias móviles (en partidos) para métricas de equipo.
+  rolling_windows: [3, 5, 8]
+  # Peso del decaimiento exponencial para la forma reciente.
+  ewm_halflife: 4
+  # Margen de seguridad antes del kickoff para el corte as-of.
+  as_of_offset_hours: 1
+  # Número de clústeres de estilo de equipo (agente no supervisado).
+  style_clusters: 6
+  # Mínimo de partidos previos en la temporada para considerar válida una fila.
+  min_prior_games: 3
+
+modeling:
+  # Semilla global para reproducibilidad.
+  random_seed: 1729
+  # Objetivos soportados.
+  targets: [winner, spread, total]
+  # Familias comparadas en cada entrenamiento.
+  families: [lightgbm, xgboost, catboost]
+  # Ensayos de Optuna por familia cuando se pasa --tune.
+  optuna_trials: 40
+  # Calibración de probabilidades: "isotonic" o "sigmoid".
+  calibration: isotonic
+
+props:
+  targets: [receiving_yards, rushing_yards, receptions, receiving_tds,
+            rushing_tds, passing_yards, passing_tds, sacks_suffered]
+  # Mínimo de snaps proyectados para emitir una proyección de prop.
+  min_projected_snaps: 10
+  # Semanas de histórico usadas en la proyección de uso.
+  usage_window: 5
+
+backtest:
+  # Walk-forward: primera temporada evaluada (las anteriores son solo entrenamiento).
+  start_season: 2015
+  end_season: 2025
+  # Cada cuántas semanas se reentrena dentro del walk-forward.
+  retrain_every_weeks: 4
+  # Temporadas mínimas de histórico antes de la primera predicción.
+  min_train_seasons: 3
+
+monitoring:
+  # Umbral de brecha train/validación que BLOQUEA la promoción a producción.
+  # Expresado como deterioro relativo permitido: 0.15 = 15 %.
+  max_train_val_gap: 0.15
+  # PSI por encima del cual una feature se marca con drift.
+  psi_threshold: 0.2
+  # Semanas que un modelo debe correr en shadow antes de poder promoverse.
+  shadow_weeks: 2
+  # Deterioro relativo frente al modelo en producción que fuerza rollback.
+  rollback_degradation: 0.10
+
+mlflow:
+  # Backend SQLite: el store de ficheros ('./mlruns') está en modo mantenimiento
+  # desde MLflow 3 y rechaza escrituras nuevas.
+  tracking_uri: sqlite:///data/mlflow.db
+  experiment_name: nfl-predictor
+
+logging:
+  level: INFO
+  # Los mensajes de log se emiten en español (decisión del usuario).
+  rich_tracebacks: true

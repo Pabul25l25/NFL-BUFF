@@ -1,0 +1,82 @@
+[project]
+name = "nfl-predictor"
+version = "0.1.0"
+description = "Plataforma de predicción NFL con backtesting walk-forward y control de overfitting"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    # --- Almacenamiento y datos ---
+    "duckdb>=1.1",
+    "pandas>=2.2,<3",          # pandas 3 aún rompe SHAP/MLflow; ver docs/decisiones-modelado.md
+    "pyarrow>=17",
+    "numpy>=1.26,<3",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",    # backend PostgreSQL opcional
+    # --- Modelado ---
+    "scikit-learn>=1.5",
+    "lightgbm>=4.5",
+    "xgboost>=2.1",
+    "catboost>=1.2",
+    "optuna>=4.0",
+    "shap>=0.46",
+    # numba es dependencia transitiva de shap; sin fijarla el resolutor elige
+    # una versión antigua (0.53) que no compila en Python 3.12.
+    "numba>=0.61",
+    "scipy>=1.14",
+    "statsmodels>=0.14",
+    # --- Orquestación y tracking ---
+    "prefect>=3.0",
+    "mlflow>=2.16",
+    # --- Dashboard ---
+    "streamlit>=1.39",
+    "plotly>=5.24",
+    # --- Infraestructura ---
+    "httpx>=0.27",
+    "tenacity>=9.0",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "typer>=0.12",
+    "rich>=13.9",
+    "pyyaml>=6.0",
+    "joblib>=1.4",
+    "jinja2>=3.1",
+]
+
+[project.scripts]
+nflp = "nflp.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=5.0",
+    "ruff>=0.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nflp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "network: pruebas que requieren acceso a internet (se omiten por defecto)",
+    "slow: pruebas lentas (entrenamiento real de modelos)",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["src/nflp"]
+omit = ["*/dashboard/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

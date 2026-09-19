@@ -1,0 +1,39 @@
+# Datos y artefactos generados
+data/
+!data/.gitkeep
+*.duckdb
+*.duckdb.wal
+mlruns/
+mlflow.db
+
+# Entorno
+.venv/
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Prefect
+.prefect/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude Code (estado local de la sesión, no del proyecto)
+.claude/
+
+# Frontend (web/) — Next.js
+web/node_modules/
+web/.next/
+web/out/
+web/.vercel/
+web/.env*.local
+web/*.tsbuildinfo
+web/next-env.d.ts

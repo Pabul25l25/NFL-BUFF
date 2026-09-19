@@ -1,0 +1,122 @@
+# NFL-Predictor — stack completo para reproducibilidad local.
+#
+# NOTA DE HONESTIDAD: este fichero se entrega según lo pedido, pero NO ha podido
+# verificarse: la máquina de desarrollo no tiene Docker instalado. La sintaxis y la
+# configuración siguen las prácticas habituales de cada servicio, pero el stack no se
+# ha levantado. Todo el proyecto funciona sin contenedores:
+#
+#   uv sync && uv run nflp db init && uv run nflp dashboard
+#
+# Servicios:
+#   postgres   backend de datos alternativo a DuckDB
+#   mlflow     servidor de tracking (backend SQLite sobre volumen compartido)
+#   prefect    servidor de orquestación
+#   dashboard  Streamlit
+#   pipeline   ejecutor puntual del pipeline (perfil "tools")
+
+name: nfl-predictor
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nflp-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nflp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nflp}
+      POSTGRES_DB: ${POSTGRES_DB:-nflp}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nflp} -d ${POSTGRES_DB:-nflp}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.1.0
+    container_name: nflp-mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  prefect:
+    image: prefecthq/prefect:3-latest
+    container_name: nflp-prefect
+    command: prefect server start --host 0.0.0.0 --port 4200
+    environment:
+      PREFECT_UI_URL: http://localhost:${PREFECT_PORT:-4200}
+      PREFECT_API_URL: http://localhost:${PREFECT_PORT:-4200}/api
+      PREFECT_SERVER_API_HOST: 0.0.0.0
+    ports:
+      - "${PREFECT_PORT:-4200}:4200"
+    volumes:
+      - prefect_data:/root/.prefect
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nflp-dashboard
+    environment:
+      # Por defecto se usa DuckDB sobre el volumen compartido. Para usar
+      # PostgreSQL, descomenta las dos líneas siguientes.
+      # NFLP_DATABASE__BACKEND: postgresql
+      # NFLP_DATABASE__POSTGRES_URL: postgresql+psycopg://nflp:nflp@postgres:5432/nflp
+      NFLP_MLFLOW__TRACKING_URI: http://mlflow:5000
+      PREFECT_API_URL: http://prefect:4200/api
+      GIT_PYTHON_REFRESH: quiet
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501"
+    volumes:
+      - nflp_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    restart: unless-stopped
+
+  # Ejecutor puntual del pipeline. No arranca con `docker compose up`.
+  #   docker compose run --rm pipeline nflp data ingest --seasons 2011:2026
+  #   docker compose run --rm pipeline nflp pipeline weekly
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nflp-pipeline
+    profiles: ["tools"]
+    environment:
+      NFLP_MLFLOW__TRACKING_URI: http://mlflow:5000
+      PREFECT_API_URL: http://prefect:4200/api
+      GIT_PYTHON_REFRESH: quiet
+    volumes:
+      - nflp_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: [""]
+    command: ["nflp", "--help"]
+
+volumes:
+  postgres_data:
+  mlflow_data:
+  prefect_data:
+  nflp_data:
