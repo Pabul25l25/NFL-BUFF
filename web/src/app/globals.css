@@ -120,6 +120,7 @@
 :root {
   /* Paleta de producto — comprometida con un único mundo visual oscuro
      ("hoja de estadísticas"), no adaptable a claro/oscuro del sistema. */
+  color-scheme: dark;
   --bg: #0b0d10;
   --surface: #101317;
   --hair: #23272e;

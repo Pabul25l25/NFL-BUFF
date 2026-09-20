@@ -11,8 +11,10 @@ const TYPE_TABS: { key: Target; label: string }[] = [
   { key: "total", label: "Total" },
 ];
 
-async function fetchPredictions(target: Target) {
-  const res = await fetch(`/api/predictions?target=${target}`);
+async function fetchPredictions(target: Target, week?: number) {
+  const params = new URLSearchParams({ target });
+  if (week) params.set("week", String(week));
+  const res = await fetch(`/api/predictions?${params}`);
   if (!res.ok) throw new Error("No se pudo cargar resultados");
   const data = await res.json();
   return data.predictions as GamePrediction[];
@@ -20,10 +22,11 @@ async function fetchPredictions(target: Target) {
 
 export default function ResultadosPage() {
   const [type, setType] = useState<Target>("winner");
+  const [week, setWeek] = useState<number | undefined>(undefined);
 
   const { data, isLoading } = useQuery({
-    queryKey: ["resultados", type],
-    queryFn: () => fetchPredictions(type),
+    queryKey: ["resultados", type, week],
+    queryFn: () => fetchPredictions(type, week),
   });
 
   const resolved = useMemo(() => {
@@ -69,7 +72,20 @@ export default function ResultadosPage() {
   return (
     <div className="flex min-h-screen flex-col pb-[78px]">
       <div className="px-[22px] pt-[calc(env(safe-area-inset-top,0px)+22px)]">
-        <div className="mb-[18px] text-[16px] font-bold">Resultados y aciertos</div>
+        <div className="mb-[18px] flex items-baseline justify-between">
+          <span className="text-[16px] font-bold">Resultados y aciertos</span>
+          <select
+            className="bg-transparent text-right text-[12px]"
+            style={{ color: "var(--text-2)", colorScheme: "dark" }}
+            value={week ?? ""}
+            onChange={(e) => setWeek(e.target.value ? Number(e.target.value) : undefined)}
+          >
+            <option value="">Todas las semanas</option>
+            {Array.from({ length: 18 }, (_, i) => i + 1).map((w) => (
+              <option key={w} value={w}>Semana {w}</option>
+            ))}
+          </select>
+        </div>
         <div className="flex gap-[22px] border-b" style={{ borderColor: "var(--hair)" }}>
           {TYPE_TABS.map((t) => {
             const active = t.key === type;
