@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { sql } from "@/lib/db";
+import { getSql } from "@/lib/db";
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -45,6 +45,6 @@ export async function GET(req: NextRequest) {
     ORDER BY point_estimate DESC
   `;
 
-  const rows = await sql.query(query, params);
+  const rows = await getSql().query(query, params);
   return NextResponse.json({ props: rows });
 }
