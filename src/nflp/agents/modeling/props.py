@@ -141,6 +141,22 @@ SPARSE_COUNT_PROPS: frozenset[str] = frozenset(
 # Peso de las pseudo-etiquetas frente a las reales.
 PSEUDO_LABEL_WEIGHT = 0.3
 
+# El objetivo por defecto de `default_params` es MAE (mediana). Para yardas
+# continuas es la elección correcta (más robusta a palizas), pero es
+# degenerada en los conteos dispersos de SPARSE_COUNT_PROPS: la mediana de
+# receiving_tds, rushing_tds, passing_tds o sacks_suffered es 0 para
+# prácticamente cualquier jugador (incluidas estrellas), porque la mayoría
+# de partidos individuales terminan en 0 eventos. Un regresor MAE aprende
+# entonces a predecir 0 siempre —técnicamente óptimo para esa métrica, pero
+# sin ninguna información—. Se fuerza L2 (media) solo para estos targets:
+# la media condicional sí es distinta de 0 y varía con el uso del jugador,
+# aunque el ajuste sea más sensible a partidos con varios TDs en uno solo.
+_SPARSE_COUNT_OBJECTIVE: dict[str, dict[str, object]] = {
+    "lightgbm": {"objective": "regression"},
+    "xgboost": {"objective": "reg:squarederror"},
+    "catboost": {"loss_function": "RMSE"},
+}
+
 
 @dataclass
 class PropDistribution:
@@ -276,6 +292,8 @@ def train_prop_model(
     y_train = train[target].astype(float)
 
     params = default_params(family, "regression", random_state)
+    if target in SPARSE_COUNT_PROPS:
+        params = {**params, **_SPARSE_COUNT_OBJECTIVE.get(family, {})}
     model = build_estimator(family, "regression", params)
 
     used_pseudo = False
