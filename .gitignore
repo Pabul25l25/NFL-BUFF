@@ -20,6 +20,9 @@ htmlcov/
 # Prefect
 .prefect/
 
+# Logs de corridas programadas
+logs/
+
 # Editor
 .vscode/
 .idea/

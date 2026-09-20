@@ -153,12 +153,21 @@ export default function PrediccionesPage() {
                 </Link>
               </div>
               <div className="flex w-[96px] shrink-0 flex-col items-end gap-[3px]">
-                <span className="text-[11.5px]" style={{ color: "var(--text-2)" }}>
-                  {pickLabel(g)}
-                </span>
-                <span className="text-[25px] font-bold leading-none tabular-nums">
-                  {displayProb(g)}%
-                </span>
+                {g.target === "total" ? (
+                  <span className="text-[25px] font-bold leading-none tabular-nums">
+                    {(g.point_estimate ?? 0).toFixed(1)}
+                    <span className="text-[13px] font-medium" style={{ color: "var(--text-2)" }}> pts</span>
+                  </span>
+                ) : (
+                  <>
+                    <span className="text-[11.5px]" style={{ color: "var(--text-2)" }}>
+                      {pickLabel(g)}
+                    </span>
+                    <span className="text-[25px] font-bold leading-none tabular-nums">
+                      {displayProb(g)}%
+                    </span>
+                  </>
+                )}
                 <span
                   className="text-[10.5px] uppercase tracking-wide"
                   style={{ color: conf.color, fontWeight: conf.weight }}
