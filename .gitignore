@@ -30,8 +30,7 @@ logs/
 .DS_Store
 
 # Claude Code (estado local de la sesión, no del proyecto)
-.claude/*
-!.claude/agents/
+.claude/
 
 # Frontend (web/) — Next.js
 web/node_modules/
