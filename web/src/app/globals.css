@@ -118,19 +118,77 @@
 }
 
 :root {
-  /* Paleta de producto — comprometida con un único mundo visual oscuro
-     ("hoja de estadísticas"), no adaptable a claro/oscuro del sistema. */
-  color-scheme: dark;
-  --bg: #0b0d10;
-  --surface: #101317;
-  --hair: #23272e;
-  --hair-soft: #1b1e23;
-  --text: #e7e9ec;
-  --text-2: #8b93a0;
-  --text-3: #565d68;
-  --accent: #c99a44;
-  --accent-soft: rgba(201, 154, 68, 0.13);
-  --side-b: #6e93b4;
+  /* Paleta de producto: tema claro por defecto (contraste AA sobre --bg y
+     --surface); el oscuro sigue prefers-color-scheme. */
+  color-scheme: light;
+  --bg: #f3f5f8;
+  --surface: #ffffff;
+  --hair: #d5dbe4;
+  --hair-soft: #e4e8ee;
+  --text: #14181f;
+  --text-2: #465061;
+  --text-3: #5d6676;
+  --accent: #8a5c0a;
+  --accent-soft: rgba(138, 92, 10, 0.1);
+  --side-b: #2d6591;
+  --scrim: rgba(20, 24, 31, 0.45);
+  --mix: 11%;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #0f1216;
+    --surface: #171c23;
+    --hair: #2a313b;
+    --hair-soft: #1f252d;
+    --text: #eceff3;
+    --text-2: #a9b2bf;
+    --text-3: #8a94a3;
+    --accent: #d4a24c;
+    --accent-soft: rgba(212, 162, 76, 0.14);
+    --side-b: #7ea3c6;
+    --scrim: rgba(4, 5, 7, 0.65);
+    --mix: 20%;
+  }
+}
+
+/* Tipografia de titulares (numeros grandes, equipos). */
+.font-display {
+  font-family: var(--font-barlow), "Arial Narrow", sans-serif;
+}
+
+/* Superficies tintadas por el color del equipo favorito (--t). */
+.tint-card {
+  background: color-mix(in srgb, var(--t, #888) var(--mix), var(--surface));
+  border: 1px solid color-mix(in srgb, var(--t, #888) 35%, var(--hair));
+  border-radius: 14px;
+}
+.tint-card:hover {
+  border-color: var(--t, #888);
+}
+.tint-hero {
+  background: linear-gradient(
+    120deg,
+    color-mix(in srgb, var(--t, #888) calc(var(--mix) + 12%), var(--surface)),
+    color-mix(in srgb, var(--t, #888) var(--mix), var(--surface))
+  );
+  border: 1px solid color-mix(in srgb, var(--t, #888) 40%, var(--hair));
+  border-radius: 16px;
+}
+.t-ink {
+  color: color-mix(in srgb, var(--t, #888) 78%, var(--text));
+}
+.pbar {
+  height: 8px;
+  border-radius: 99px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+.pbar > i {
+  display: block;
+  height: 100%;
+  background: var(--t, var(--accent));
 }
 
 @layer base {

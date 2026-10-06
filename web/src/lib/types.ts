@@ -71,25 +71,38 @@ export const STAT_DEFS: { key: string; label: string; sparse?: boolean }[] = [
   { key: "sacks_suffered", label: "Capturas", sparse: true },
 ];
 
-export function pickLabel(pred: GamePrediction): string {
+/** Equipo favorito segun el target; null si no aplica (total) o falta el dato. */
+export function favoriteTeam(pred: GamePrediction): string | null {
   if (pred.target === "winner") {
-    const winner = (pred.probability ?? 0) >= 0.5 ? pred.home_team : pred.away_team;
-    const prob = pred.probability ?? 0;
-    const pct = Math.round((prob >= 0.5 ? prob : 1 - prob) * 100);
-    return `${winner} · ${pct}%`;
+    if (pred.probability == null) return null;
+    return pred.probability >= 0.5 ? pred.home_team : pred.away_team;
   }
   if (pred.target === "spread") {
-    const margin = pred.point_estimate ?? 0;
-    const favored = margin >= 0 ? pred.home_team : pred.away_team;
-    return `${favored} ${margin >= 0 ? "-" : "+"}${Math.abs(margin).toFixed(1)}`;
+    if (pred.point_estimate == null) return null;
+    return pred.point_estimate >= 0 ? pred.home_team : pred.away_team;
   }
-  return `${(pred.point_estimate ?? 0).toFixed(1)} pts`;
+  return null;
 }
 
-export function displayProb(pred: GamePrediction): number {
+export function pickLabel(pred: GamePrediction): string {
+  if (pred.target === "total") {
+    return pred.point_estimate == null ? "—" : `${pred.point_estimate.toFixed(1)} pts`;
+  }
+  const fav = favoriteTeam(pred);
+  if (!fav) return "—";
   if (pred.target === "winner") {
-    const prob = pred.probability ?? 0;
+    return `${fav} · ${displayProb(pred)}%`;
+  }
+  const margin = pred.point_estimate ?? 0;
+  return `${fav} ${margin >= 0 ? "-" : "+"}${Math.abs(margin).toFixed(1)}`;
+}
+
+/** Probabilidad en %, o null si falta (spread/total suelen no tenerla). Winner: la del favorito. */
+export function displayProb(pred: GamePrediction): number | null {
+  if (pred.probability == null) return null;
+  if (pred.target === "winner") {
+    const prob = pred.probability;
     return Math.round((prob >= 0.5 ? prob : 1 - prob) * 100);
   }
-  return Math.round((pred.probability ?? 0) * 100);
+  return Math.round(pred.probability * 100);
 }

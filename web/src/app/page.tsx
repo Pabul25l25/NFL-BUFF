@@ -2,10 +2,13 @@
 
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import Link from "next/link";
 import { BottomNav } from "@/components/bottom-nav";
-import { TEAM_COLORS, TEAMS } from "@/lib/teams";
-import { GamePrediction, Target, displayProb, pickLabel } from "@/lib/types";
+import { GameCard } from "@/components/game-card";
+import { TEAMS } from "@/lib/teams";
+import { GamePrediction, Target } from "@/lib/types";
+import { groupByWeek, selectWeek, weekNumbers } from "@/lib/weeks";
+
+const SELECT_STYLE = { background: "var(--surface)", color: "var(--text)" };
 
 const TYPE_TABS: { key: Target; label: string }[] = [
   { key: "winner", label: "Ganador" },
@@ -13,9 +16,8 @@ const TYPE_TABS: { key: Target; label: string }[] = [
   { key: "total", label: "Total" },
 ];
 
-async function fetchPredictions(target: Target, week?: number, team?: string) {
+async function fetchPredictions(target: Target, team?: string) {
   const params = new URLSearchParams({ target });
-  if (week) params.set("week", String(week));
   if (team) params.set("team", team);
   const res = await fetch(`/api/predictions?${params}`);
   if (!res.ok) throw new Error("No se pudo cargar predicciones");
@@ -23,47 +25,47 @@ async function fetchPredictions(target: Target, week?: number, team?: string) {
   return data.predictions as GamePrediction[];
 }
 
-function confClass(conf: string | null): { color: string; weight: number } {
-  if (conf === "alta") return { color: "var(--text)", weight: 600 };
-  if (conf === "media") return { color: "var(--text-2)", weight: 500 };
-  return { color: "var(--text-3)", weight: 500 };
-}
-
 export default function PrediccionesPage() {
   const [type, setType] = useState<Target>("winner");
-  const [week, setWeek] = useState<number | undefined>(undefined);
+  const [week, setWeek] = useState<"next" | "all" | number>("next");
   const [team, setTeam] = useState<string | undefined>(undefined);
   const [sheetOpen, setSheetOpen] = useState(false);
+  const [now] = useState(() => Date.now());
 
   const { data, isLoading, isError } = useQuery({
-    queryKey: ["predictions", type, week, team],
-    queryFn: () => fetchPredictions(type, week, team),
+    queryKey: ["predictions", type, team],
+    queryFn: () => fetchPredictions(type, team),
   });
 
-  const upcoming = useMemo(() => {
-    if (!data) return [];
-    const now = Date.now();
-    const future = data.filter((g) => new Date(g.kickoff_utc).getTime() >= now);
-    const pool = future.length > 0 ? future : data;
-    return [...pool].sort(
-      (a, b) => new Date(a.kickoff_utc).getTime() - new Date(b.kickoff_utc).getTime()
-    );
-  }, [data]);
+  const sel = useMemo(
+    () => selectWeek(data, now, { week: typeof week === "number" ? week : undefined }),
+    [data, now, week]
+  );
+  const groups = useMemo(() => (week === "all" ? groupByWeek(data) : []), [data, week]);
+  const weekOpts = useMemo(() => weekNumbers(data), [data]);
+  const upcoming = week === "all" ? [] : sel.rows;
+  const total = week === "all" ? (data?.length ?? 0) : upcoming.length;
 
-  const weekLabel = week ?? upcoming[0]?.week ?? "—";
-  const seasonLabel = upcoming[0]?.season ?? new Date().getFullYear();
+  const weekLabel = sel.week ?? (typeof week === "number" ? week : "—");
+  const seasonLabel = sel.season ?? "";
 
   return (
     <div className="flex min-h-screen flex-col pb-[78px]">
       <div className="px-[22px] pt-[env(safe-area-inset-top,0px)]">
         <div className="flex items-baseline justify-between pt-[22px] pb-[18px]">
-          <span className="text-[16px] font-bold tracking-tight">NFL-Predictor</span>
+          <span className="flex items-center gap-2 text-[16px] font-bold tracking-tight">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/icon.svg" alt="" width={20} height={20} />
+            NFL-Predictor
+          </span>
           <button
             onClick={() => setSheetOpen(true)}
             className="border-b border-dotted text-[12px]"
             style={{ color: "var(--text-2)", borderColor: "var(--text-3)" }}
           >
-            Semana {weekLabel} · {seasonLabel}
+            {week === "all"
+              ? "Todas las semanas"
+              : `${sel.latest ? "Última semana" : "Semana"} ${weekLabel} · ${seasonLabel}`}
           </button>
         </div>
         <div className="flex gap-[22px] border-b" style={{ borderColor: "var(--hair)" }}>
@@ -103,87 +105,41 @@ export default function PrediccionesPage() {
             No se pudieron cargar las predicciones. Intenta de nuevo.
           </p>
         )}
-        {!isLoading && !isError && upcoming.length === 0 && (
+        {!isLoading && !isError && total === 0 && (
           <p className="pt-6 text-[13px]" style={{ color: "var(--text-2)" }}>
             No hay predicciones para este filtro.
           </p>
         )}
 
-        {upcoming.map((g) => {
-          const conf = confClass(g.confidence_level);
-          const meta =
-            g.roof === "dome" || g.roof === "closed"
-              ? `${g.stadium} · techo cerrado`
-              : `${g.stadium}${g.temperature_c != null ? ` · ${Math.round(g.temperature_c)}°C · ${Math.round(g.wind_kph ?? 0)} km/h` : ""}`;
-          return (
-            <div
-              key={g.game_id}
-              className="flex gap-[14px] py-5"
-              style={{ borderBottom: "1px solid var(--hair-soft)" }}
-            >
-              <div
-                className="w-[3px] shrink-0 rounded-sm"
-                style={{ background: TEAM_COLORS[g.home_team] ?? "var(--text-3)" }}
-              />
-              <div className="flex min-w-0 flex-1 flex-col gap-2">
-                <div className="text-[16px] font-bold tracking-tight">
-                  {g.away_team}
-                  <span className="mx-[5px] font-medium" style={{ color: "var(--text-3)" }}>
-                    @
-                  </span>
-                  {g.home_team}
-                </div>
-                <div
-                  className="text-[11px] uppercase tracking-wide"
-                  style={{ color: "var(--text-3)" }}
-                >
-                  Semana {g.week} · {meta}
-                </div>
-                {g.explanation_es && (
-                  <p className="text-[12.5px] leading-snug" style={{ color: "var(--text-2)" }}>
-                    {g.explanation_es}
-                  </p>
-                )}
-                <Link
-                  href={`/partido/${g.game_id}?target=${g.target}`}
-                  className="pt-1 text-left text-[11.5px] font-semibold"
-                  style={{ color: "var(--accent)" }}
-                >
-                  Ver detalle →
-                </Link>
+        {week === "all" ? (
+          groups.map((grp) => (
+            <section key={`${grp.season}-${grp.week}`}>
+              <h2
+                className="mt-6 border-b pb-2 text-[11px] font-semibold uppercase tracking-wide tabular-nums"
+                style={{ color: "var(--text-2)", borderColor: "var(--hair)" }}
+              >
+                Semana {grp.week} · {grp.season}
+              </h2>
+              <div className="grid grid-cols-1 gap-3 pt-4 sm:grid-cols-2 lg:grid-cols-3">
+                {grp.rows.map((g) => (
+                  <GameCard key={g.game_id} g={g} />
+                ))}
               </div>
-              <div className="flex w-[96px] shrink-0 flex-col items-end gap-[3px]">
-                {g.target === "total" ? (
-                  <span className="text-[25px] font-bold leading-none tabular-nums">
-                    {(g.point_estimate ?? 0).toFixed(1)}
-                    <span className="text-[13px] font-medium" style={{ color: "var(--text-2)" }}> pts</span>
-                  </span>
-                ) : (
-                  <>
-                    <span className="text-[11.5px]" style={{ color: "var(--text-2)" }}>
-                      {pickLabel(g)}
-                    </span>
-                    <span className="text-[25px] font-bold leading-none tabular-nums">
-                      {displayProb(g)}%
-                    </span>
-                  </>
-                )}
-                <span
-                  className="text-[10.5px] uppercase tracking-wide"
-                  style={{ color: conf.color, fontWeight: conf.weight }}
-                >
-                  {g.confidence_level}
-                </span>
-              </div>
-            </div>
-          );
-        })}
+            </section>
+          ))
+        ) : (
+          <div className="grid grid-cols-1 gap-3 pt-5 sm:grid-cols-2 lg:grid-cols-3">
+            {upcoming.map((g) => (
+              <GameCard key={g.game_id} g={g} />
+            ))}
+          </div>
+        )}
       </div>
 
       {sheetOpen && (
         <div
           className="fixed inset-0 z-20 flex items-end"
-          style={{ background: "rgba(4,5,7,0.65)" }}
+          style={{ background: "var(--scrim)" }}
           onClick={(e) => e.target === e.currentTarget && setSheetOpen(false)}
         >
           <div
@@ -203,26 +159,32 @@ export default function PrediccionesPage() {
             <label className="flex items-center justify-between py-[13px] text-[13px]" style={{ borderBottom: "1px solid var(--hair-soft)" }}>
               <span className="text-[12px]" style={{ color: "var(--text-2)" }}>Semana</span>
               <select
-                className="bg-transparent text-right font-semibold"
-                value={week ?? ""}
-                onChange={(e) => setWeek(e.target.value ? Number(e.target.value) : undefined)}
+                className="text-right font-semibold"
+                style={SELECT_STYLE}
+                value={String(week)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setWeek(v === "next" || v === "all" ? v : Number(v));
+                }}
               >
-                <option value="">Todas</option>
-                {Array.from({ length: 18 }, (_, i) => i + 1).map((w) => (
-                  <option key={w} value={w}>{w}</option>
+                <option value="next" style={SELECT_STYLE}>Próxima</option>
+                <option value="all" style={SELECT_STYLE}>Todas las semanas</option>
+                {weekOpts.map((w) => (
+                  <option key={w} value={w} style={SELECT_STYLE}>{w}</option>
                 ))}
               </select>
             </label>
             <label className="flex items-center justify-between py-[13px] text-[13px]" style={{ borderBottom: "1px solid var(--hair-soft)" }}>
               <span className="text-[12px]" style={{ color: "var(--text-2)" }}>Equipo</span>
               <select
-                className="bg-transparent text-right font-semibold"
+                className="text-right font-semibold"
+                style={SELECT_STYLE}
                 value={team ?? ""}
                 onChange={(e) => setTeam(e.target.value || undefined)}
               >
-                <option value="">Todos</option>
+                <option value="" style={SELECT_STYLE}>Todos</option>
                 {TEAMS.map((t) => (
-                  <option key={t} value={t}>{t}</option>
+                  <option key={t} value={t} style={SELECT_STYLE}>{t}</option>
                 ))}
               </select>
             </label>

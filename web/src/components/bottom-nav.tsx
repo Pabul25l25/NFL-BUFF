@@ -77,6 +77,7 @@ export function BottomNav({ active }: { active: NavKey }) {
       style={{
         background: "var(--surface)",
         borderColor: "var(--hair)",
+        boxShadow: "0 -1px 8px color-mix(in srgb, var(--text) 6%, transparent)",
         height: "calc(62px + env(safe-area-inset-bottom, 0px))",
         paddingBottom: "env(safe-area-inset-bottom, 0px)",
       }}
@@ -87,9 +88,13 @@ export function BottomNav({ active }: { active: NavKey }) {
           <Link
             key={item.key}
             href={item.href}
-            className="flex flex-1 flex-col items-center justify-center gap-1 text-[9.5px] font-medium"
-            style={{ color: isActive ? "var(--text)" : "var(--text-3)", fontWeight: isActive ? 600 : 500 }}
+            aria-current={isActive ? "page" : undefined}
+            className="relative flex flex-1 flex-col items-center justify-center gap-1 text-[10px] font-medium"
+            style={{ color: isActive ? "var(--text)" : "var(--text-2)", fontWeight: isActive ? 600 : 500 }}
           >
+            {isActive && (
+              <span className="absolute -top-px left-1/2 h-[2px] w-8 -translate-x-1/2" style={{ background: "var(--accent)" }} />
+            )}
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" className="h-[18px] w-[18px]">
               {item.icon}
             </svg>

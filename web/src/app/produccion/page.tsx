@@ -46,10 +46,12 @@ async function fetchDrift() {
   return data.features as DriftRow[];
 }
 
-function driftLabel(psi: number): { text: string; color: string } {
-  if (psi > 0.25) return { text: "severo", color: "var(--side-b)" };
-  if (psi > 0.1) return { text: "moderado", color: "var(--accent)" };
-  return { text: "estable", color: "var(--text-3)" };
+function driftLabel(psi: number): { text: string; color: string; mark: string } {
+  // Texto en --text/--text-2 (el dorado y el azul claros no alcanzan contraste como texto);
+  // el estado se marca además con el color del borde izquierdo en la fila.
+  if (psi > 0.25) return { text: "severo", color: "var(--text)", mark: "var(--side-b)" };
+  if (psi > 0.1) return { text: "moderado", color: "var(--text)", mark: "var(--accent)" };
+  return { text: "estable", color: "var(--text-2)", mark: "var(--hair)" };
 }
 
 export default function ProduccionPage() {
@@ -101,13 +103,14 @@ export default function ProduccionPage() {
           <div style={{ height: 160 }} className="mt-2">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={chartData} margin={{ top: 8, right: 4, bottom: 0, left: -24 }}>
-                <XAxis dataKey="label" tick={{ fontSize: 9, fill: "var(--text-3)" }} axisLine={{ stroke: "var(--hair)" }} tickLine={false} interval="preserveStartEnd" />
-                <YAxis tick={{ fontSize: 9, fill: "var(--text-3)" }} axisLine={false} tickLine={false} width={32} />
+                <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--text-2)" }} axisLine={{ stroke: "var(--hair)" }} tickLine={false} interval="preserveStartEnd" />
+                <YAxis tick={{ fontSize: 10, fill: "var(--text-2)" }} axisLine={false} tickLine={false} width={32} />
                 <Tooltip
-                  contentStyle={{ background: "var(--surface)", border: "1px solid var(--hair)", fontSize: 11 }}
+                  contentStyle={{ background: "var(--surface)", border: "1px solid var(--hair)", borderRadius: 8, fontSize: 12, color: "var(--text)" }}
                   labelStyle={{ color: "var(--text-2)" }}
+                  itemStyle={{ color: "var(--text)" }}
                 />
-                <Line type="monotone" dataKey="value" stroke="var(--accent)" strokeWidth={1.5} dot={{ r: 2, fill: "var(--accent)" }} />
+                <Line type="monotone" dataKey="value" stroke="var(--accent)" strokeWidth={2} dot={{ r: 2.5, fill: "var(--accent)", stroke: "var(--surface)", strokeWidth: 1 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -117,7 +120,7 @@ export default function ProduccionPage() {
           <div key={`${p.season}-${p.week}`} className="flex items-center justify-between py-3" style={{ borderBottom: "1px solid var(--hair-soft)" }}>
             <div>
               <div className="text-[13px] font-semibold">Semana {p.week} · {p.season}</div>
-              <div className="text-[11px] uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
+              <div className="text-[11px] uppercase tracking-wide" style={{ color: "var(--text-2)" }}>
                 {p.family ?? "—"} v{p.version ?? "—"} · {p.n_predictions} predicciones
               </div>
             </div>
@@ -127,7 +130,7 @@ export default function ProduccionPage() {
           </div>
         ))}
 
-        <div className="mb-1 mt-8 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
+        <div className="mb-1 mt-8 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-2)" }}>
           Drift de features
         </div>
         <p className="mb-2 text-[11.5px] leading-relaxed" style={{ color: "var(--text-2)" }}>
@@ -136,7 +139,7 @@ export default function ProduccionPage() {
         {(drift ?? []).slice(0, 15).map((d) => {
           const s = driftLabel(d.psi);
           return (
-            <div key={d.feature_name} className="flex items-center justify-between py-3" style={{ borderBottom: "1px solid var(--hair-soft)" }}>
+            <div key={d.feature_name} className="flex items-center justify-between py-3 pl-3" style={{ borderBottom: "1px solid var(--hair-soft)", borderLeft: `3px solid ${s.mark}` }}>
               <span className="text-[12.5px]">{d.feature_name}</span>
               <span className="text-[12px] font-semibold tabular-nums" style={{ color: s.color }}>
                 {d.psi.toFixed(3)} · {s.text}

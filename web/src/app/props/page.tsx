@@ -3,7 +3,22 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { BottomNav } from "@/components/bottom-nav";
-import { STAT_DEFS, PropPrediction } from "@/lib/types";
+import { GameGroup, PropGroups } from "@/components/prop-table";
+import { GamePrediction, STAT_DEFS, PropPrediction, favoriteTeam } from "@/lib/types";
+import { upcomingWeek } from "@/lib/weeks";
+
+const PAGE = 40;
+
+const UNITS: Record<string, string> = {
+  receiving_yards: "yds",
+  rushing_yards: "yds",
+  passing_yards: "yds",
+  receptions: "rec",
+  receiving_tds: "TD",
+  rushing_tds: "TD",
+  passing_tds: "TD",
+  sacks_suffered: "caps.",
+};
 
 async function fetchProps(target: string) {
   const params = new URLSearchParams({ target });
@@ -13,59 +28,199 @@ async function fetchProps(target: string) {
   return data.props as PropPrediction[];
 }
 
+async function fetchWinners() {
+  const params = new URLSearchParams({ target: "winner" });
+  const res = await fetch(`/api/predictions?${params}`);
+  if (!res.ok) throw new Error("No se pudo cargar favoritos");
+  const data = await res.json();
+  return data.predictions as GamePrediction[];
+}
+
+interface SyncRow {
+  table_name: string;
+  synced_at: string | null;
+}
+
+async function fetchStatus() {
+  const res = await fetch("/api/status");
+  if (!res.ok) throw new Error("No se pudo cargar el estado");
+  const data = await res.json();
+  return data.sync as SyncRow[];
+}
+
+/** Fecha de la ultima publicacion: la de la tabla de props si existe, o la mas reciente. */
+function lastPublished(sync: SyncRow[] | undefined): Date | null {
+  const rows = (sync ?? []).filter((r) => r.synced_at);
+  const props = rows.filter((r) => /prop/i.test(r.table_name));
+  const pool = props.length > 0 ? props : rows;
+  if (pool.length === 0) return null;
+  return new Date(Math.max(...pool.map((r) => new Date(r.synced_at as string).getTime())));
+}
+
+/** Filtra, ordena y pagina las proyecciones; agrupa por partido en orden de kickoff. */
+function buildGroups(
+  rows: PropPrediction[],
+  favorites: Map<string, string | null>,
+  f: { pos: string; team: string; game: string },
+  shown: number
+): { groups: GameGroup[]; total: number } {
+  const ts = (r: PropPrediction) => new Date(r.kickoff_utc).getTime();
+  const filtered = rows
+    .filter(
+      (p) =>
+        (!f.pos || p.position === f.pos) &&
+        (!f.team || p.team === f.team) &&
+        (!f.game || p.game_id === f.game)
+    )
+    .sort((a, b) => ts(a) - ts(b) || a.game_id.localeCompare(b.game_id) || (b.point_estimate ?? 0) - (a.point_estimate ?? 0));
+  const map = new Map<string, GameGroup>();
+  for (const p of filtered.slice(0, shown)) {
+    let g = map.get(p.game_id);
+    if (!g) {
+      g = {
+        game_id: p.game_id,
+        home_team: p.home_team,
+        away_team: p.away_team,
+        kickoff_utc: p.kickoff_utc,
+        favorite: favorites.get(p.game_id) ?? null,
+        rows: [],
+      };
+      map.set(p.game_id, g);
+    }
+    g.rows.push(p);
+  }
+  return { groups: [...map.values()], total: filtered.length };
+}
+
+const selectStyle = {
+  background: "var(--surface)",
+  color: "var(--text)",
+  border: "1px solid var(--hair)",
+};
+
 export default function PropsPage() {
   const [stat, setStat] = useState("receiving_yards");
-  const [selectedGsis, setSelectedGsis] = useState<string | null>(null);
+  const [pos, setPos] = useState("");
+  const [team, setTeam] = useState("");
+  const [game, setGame] = useState("");
+  const [shown, setShown] = useState(PAGE);
+  const [now] = useState(() => Date.now());
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError } = useQuery({
     queryKey: ["props", stat],
     queryFn: () => fetchProps(stat),
   });
+  const { data: winners } = useQuery({
+    queryKey: ["predictions", "winner", undefined],
+    queryFn: fetchWinners,
+  });
+  const { data: sync } = useQuery({ queryKey: ["status"], queryFn: fetchStatus });
 
-  const upcoming = useMemo(() => {
-    if (!data) return [];
-    const now = Date.now();
-    const future = data.filter((p) => new Date(p.kickoff_utc).getTime() >= now);
-    const pool = future.length > 0 ? future : data;
-    return [...pool].sort((a, b) => (b.point_estimate ?? 0) - (a.point_estimate ?? 0)).slice(0, 12);
-  }, [data]);
+  // Solo partidos futuros de la proxima semana; nunca datos pasados.
+  const sel = useMemo(() => upcomingWeek(data, now), [data, now]);
+
+  const favorites = useMemo(() => {
+    const m = new Map<string, string | null>();
+    for (const w of winners ?? []) m.set(w.game_id, favoriteTeam(w));
+    return m;
+  }, [winners]);
+
+  const positions = useMemo(
+    () => [...new Set(sel.rows.map((p) => p.position).filter((x): x is string => !!x))].sort(),
+    [sel.rows]
+  );
+  const teams = useMemo(() => [...new Set(sel.rows.map((p) => p.team))].sort(), [sel.rows]);
+  const games = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const p of sel.rows) m.set(p.game_id, `${p.away_team} @ ${p.home_team}`);
+    return [...m.entries()];
+  }, [sel.rows]);
+
+  const { groups, total } = useMemo(
+    () => buildGroups(sel.rows, favorites, { pos, team, game }, shown),
+    [sel.rows, favorites, pos, team, game, shown]
+  );
+  const shownCount = groups.reduce((n, g) => n + g.rows.length, 0);
 
   const statDef = STAT_DEFS.find((s) => s.key === stat)!;
-  const selected = upcoming.find((p) => p.gsis_id === selectedGsis) ?? upcoming[0] ?? null;
+  const published = lastPublished(sync);
+  const noUpcoming = !isLoading && !isError && sel.rows.length === 0;
 
   return (
     <div className="flex min-h-screen flex-col pb-[78px]">
       <div className="px-[22px] pt-[calc(env(safe-area-inset-top,0px)+22px)]">
-        <div className="mb-[18px] flex items-baseline justify-between">
-          <span className="text-[16px] font-bold">Props</span>
+        <div className="mb-[14px] flex items-baseline justify-between">
+          <span className="text-[16px] font-bold">Proyecciones de jugadores</span>
           <span className="text-[11px] uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
-            {upcoming[0]?.season ?? new Date().getFullYear()} · próximos partidos
+            {sel.week != null ? `Próxima semana · Semana ${sel.week} · ${sel.season}` : "—"}
           </span>
         </div>
-        <div className="flex gap-[18px] overflow-x-auto border-b" style={{ borderColor: "var(--hair)" }}>
+        <div className="flex flex-wrap gap-[6px] pb-3">
           {STAT_DEFS.map((s) => {
             const active = s.key === stat;
             return (
               <button
                 key={s.key}
-                onClick={() => { setStat(s.key); setSelectedGsis(null); }}
-                className="relative shrink-0 whitespace-nowrap pb-3 text-[12.5px]"
-                style={{ color: active ? "var(--text)" : "var(--text-3)", fontWeight: active ? 600 : 500 }}
+                onClick={() => { setStat(s.key); setPos(""); setTeam(""); setGame(""); setShown(PAGE); }}
+                aria-pressed={active}
+                className="rounded-full px-3 py-[6px] text-[12.5px] font-medium"
+                style={{
+                  background: active ? "var(--text)" : "var(--surface)",
+                  color: active ? "var(--bg)" : "var(--text-2)",
+                  border: `1px solid ${active ? "var(--text)" : "var(--hair)"}`,
+                }}
               >
                 {s.label}
-                {active && (
-                  <span className="absolute -bottom-px left-0 right-0 h-[2px]" style={{ background: "var(--accent)" }} />
-                )}
               </button>
             );
           })}
         </div>
+        {sel.rows.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 pb-3 text-[12px]" style={{ color: "var(--text-2)" }}>
+            <label htmlFor="f-game">Partido</label>
+            <select
+              id="f-game"
+              className="rounded-lg px-2 py-[6px]"
+              style={selectStyle}
+              value={game}
+              onChange={(e) => { setGame(e.target.value); setShown(PAGE); }}
+            >
+              <option value="">Todos</option>
+              {games.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+            </select>
+            <label htmlFor="f-pos">Posición</label>
+            <select
+              id="f-pos"
+              className="rounded-lg px-2 py-[6px]"
+              style={selectStyle}
+              value={pos}
+              onChange={(e) => { setPos(e.target.value); setShown(PAGE); }}
+            >
+              <option value="">Todas</option>
+              {positions.map((x) => <option key={x} value={x}>{x}</option>)}
+            </select>
+            <label htmlFor="f-team">Equipo</label>
+            <select
+              id="f-team"
+              className="rounded-lg px-2 py-[6px]"
+              style={selectStyle}
+              value={team}
+              onChange={(e) => { setTeam(e.target.value); setShown(PAGE); }}
+            >
+              <option value="">Todos</option>
+              {teams.map((x) => <option key={x} value={x}>{x}</option>)}
+            </select>
+            <span className="ml-auto tabular-nums">
+              {shownCount} de {total} jugadores
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="flex-1 px-[22px]">
-        {statDef.sparse && (
+        {statDef.sparse && sel.rows.length > 0 && (
           <div
-            className="my-4 py-2 pl-3 text-[11.5px] leading-relaxed"
+            className="mb-4 py-2 pl-3 text-[11.5px] leading-relaxed"
             style={{ color: "var(--accent)", borderLeft: "2px solid var(--accent)" }}
           >
             Conteo poco frecuente — la mayoría de partidos son 0. La proyección es una aproximación más basta que en yardas continuas.
@@ -73,63 +228,44 @@ export default function PropsPage() {
         )}
 
         {isLoading && (
-          <p className="pt-6 text-[13px]" style={{ color: "var(--text-2)" }}>Cargando…</p>
+          <p className="pt-2 text-[13px]" style={{ color: "var(--text-2)" }}>Cargando…</p>
+        )}
+        {isError && (
+          <p className="pt-2 text-[13px]" style={{ color: "var(--side-b)" }}>
+            No se pudieron cargar las proyecciones. Intenta de nuevo.
+          </p>
+        )}
+        {noUpcoming && (
+          <div className="pt-2 text-[13px] leading-relaxed" style={{ color: "var(--text-2)" }}>
+            <p>Aún no hay proyecciones para la próxima semana; se publican cuando corre el ciclo semanal.</p>
+            {published && (
+              <p className="mt-2 text-[12px] tabular-nums" style={{ color: "var(--text-3)" }}>
+                Última publicación: {published.toLocaleString("es-MX", { dateStyle: "medium", timeStyle: "short" })}
+              </p>
+            )}
+          </div>
+        )}
+        {sel.rows.length > 0 && total === 0 && (
+          <p className="pt-2 text-[13px]" style={{ color: "var(--text-2)" }}>
+            No hay proyecciones para este filtro.
+          </p>
         )}
 
-        <div className="mb-1 mt-[22px] text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
-          Jugadores destacados
-        </div>
-        {upcoming.map((p) => (
-          <button
-            key={`${p.game_id}-${p.gsis_id}`}
-            onClick={() => setSelectedGsis(p.gsis_id)}
-            className="flex w-full items-baseline justify-between gap-[10px] py-[14px] text-left"
-            style={{ borderBottom: "1px solid var(--hair-soft)" }}
-          >
-            <div>
-              <div className="text-[14.5px] font-semibold">{p.player_name}</div>
-              <div className="text-[11px] uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
-                {p.team} · {p.position}
-              </div>
-            </div>
-            <div className="shrink-0 text-right">
-              <div className="text-[18px] font-bold tabular-nums">{(p.point_estimate ?? 0).toFixed(1)}</div>
-              <div className="text-[10.5px] tabular-nums" style={{ color: "var(--text-3)" }}>
-                rango {(p.lower_80 ?? 0).toFixed(0)}–{(p.upper_80 ?? 0).toFixed(0)}
-              </div>
-            </div>
-          </button>
-        ))}
-
-        {selected && (
+        {groups.length > 0 && (
           <>
-            <div className="mb-1 mt-[22px] text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
-              Detalle — {selected.player_name}
-            </div>
-            <div className="mt-2 p-4" style={{ border: "1px solid var(--hair)" }}>
-              <div className="flex items-baseline justify-between">
-                <div>
-                  <div className="text-[15px] font-semibold">{selected.player_name}</div>
-                  <div className="text-[11px] uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
-                    {selected.team} · {selected.position} · vs {selected.team === selected.home_team ? selected.away_team : selected.home_team}
-                  </div>
-                </div>
-                <div className="text-right">
-                  <div className="text-[22px] font-bold tabular-nums">{(selected.point_estimate ?? 0).toFixed(1)}</div>
-                  <div className="text-[10.5px] tabular-nums" style={{ color: "var(--text-3)" }}>
-                    rango {(selected.lower_80 ?? 0).toFixed(0)}–{(selected.upper_80 ?? 0).toFixed(0)}
-                  </div>
-                </div>
-              </div>
-              {selected.explanation_es && (
-                <p className="mt-3 text-[12.5px] leading-relaxed" style={{ color: "var(--text-2)" }}>
-                  {selected.explanation_es}
-                </p>
-              )}
-              <div className="mt-3 pt-[10px] text-[10.5px] leading-loose" style={{ color: "var(--text-3)", borderTop: "1px solid var(--hair)" }}>
-                as-of {selected.as_of_ts ? new Date(selected.as_of_ts).toLocaleString("es-MX") : "—"}
-              </div>
-            </div>
+            <PropGroups groups={groups} unit={UNITS[stat] ?? ""} />
+            <p className="mt-2 text-[11px]" style={{ color: "var(--text-3)" }}>
+              La barra muestra el rango del 80 % y la marca la proyección. Toca una fila con + para ver la explicación.
+            </p>
+            {shownCount < total && (
+              <button
+                onClick={() => setShown((n) => n + PAGE)}
+                className="mx-auto mt-3 block rounded-[9px] px-[18px] py-[9px] text-[13px] font-medium"
+                style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--hair)" }}
+              >
+                Ver más jugadores
+              </button>
+            )}
           </>
         )}
       </div>

@@ -71,7 +71,7 @@ export default function ModelosPage() {
               <div className="text-[13.5px] font-semibold">
                 {m.target} <span style={{ color: "var(--text-3)", fontWeight: 500 }}>· {m.family} v{m.version}</span>
               </div>
-              <div className="text-[11px] uppercase tracking-wide" style={{ color: m.status === "production" ? "var(--accent)" : "var(--text-3)" }}>
+              <div className="text-[11px] uppercase tracking-wide" style={{ color: m.status === "production" ? "var(--text)" : "var(--text-2)", fontWeight: m.status === "production" ? 600 : 400 }}>
                 {STATUS_LABEL[m.status] ?? m.status}
                 {m.train_val_gap != null && ` · brecha ${(m.train_val_gap * 100).toFixed(1)}%`}
               </div>
@@ -80,21 +80,21 @@ export default function ModelosPage() {
               <div className="text-[13px] font-semibold tabular-nums">
                 {m.val_metric != null ? m.val_metric.toFixed(4) : "—"}
               </div>
-              <div className="text-[10px] uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
+              <div className="text-[10px] uppercase tracking-wide" style={{ color: "var(--text-2)" }}>
                 {m.metric_name ?? ""}
               </div>
             </div>
           </div>
         ))}
 
-        <div className="mb-1 mt-8 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
+        <div className="mb-1 mt-8 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-2)" }}>
           Bitácora de reentrenamiento
         </div>
         {(log ?? []).map((l, i) => (
           <div key={i} className="flex flex-col gap-1 py-3" style={{ borderBottom: "1px solid var(--hair-soft)" }}>
             <div className="flex items-baseline justify-between">
               <span className="text-[12.5px] font-semibold">{l.target} · {l.action}</span>
-              <span className="text-[10.5px] tabular-nums" style={{ color: "var(--text-3)" }}>
+              <span className="text-[10.5px] tabular-nums" style={{ color: "var(--text-2)" }}>
                 {new Date(l.occurred_at).toLocaleDateString("es-MX")}
               </span>
             </div>

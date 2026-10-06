@@ -47,7 +47,7 @@ export default function CalibracionPage() {
       <div className="px-[22px] pt-[calc(env(safe-area-inset-top,0px)+22px)]">
         <div className="text-[16px] font-bold">Calibración</div>
         <p className="mt-2 text-[12.5px] leading-relaxed" style={{ color: "var(--text-2)" }}>
-          Si el modelo dice &ldquo;70%&rdquo;, debería acertar el 70% de las veces. La barra clara es lo predicho, la sólida lo observado.
+          Si el modelo dice &ldquo;70%&rdquo;, debería acertar el 70% de las veces. La barra azul es lo predicho, la dorada lo observado.
         </p>
       </div>
 
@@ -65,25 +65,31 @@ export default function CalibracionPage() {
               <span style={{ color: "var(--text-2)" }}>
                 {(b.bin_lower * 100).toFixed(0)}–{(b.bin_upper * 100).toFixed(0)}%
               </span>
-              <span className="tabular-nums" style={{ color: "var(--text-3)" }}>n={b.n_samples}</span>
+              <span className="tabular-nums" style={{ color: "var(--text-2)" }}>n={b.n_samples}</span>
             </div>
-            <div className="relative h-[3px]" style={{ background: "var(--hair)" }}>
-              <div className="absolute inset-y-0 left-0" style={{ width: `${b.mean_predicted * 100}%`, background: "var(--side-b)" }} />
+            <div className="relative h-[5px] rounded-[3px]" style={{ background: "var(--hair-soft)", boxShadow: "inset 0 0 0 1px var(--hair)" }}>
+              <div className="absolute inset-y-0 left-0 rounded-[3px]" style={{ width: `${b.mean_predicted * 100}%`, background: "var(--side-b)" }} />
             </div>
-            <div className="relative h-[3px]" style={{ background: "var(--hair)" }}>
-              <div className="absolute inset-y-0 left-0" style={{ width: `${b.observed_frequency * 100}%`, background: "var(--accent)" }} />
+            <div className="relative h-[5px] rounded-[3px]" style={{ background: "var(--hair-soft)", boxShadow: "inset 0 0 0 1px var(--hair)" }}>
+              <div className="absolute inset-y-0 left-0 rounded-[3px]" style={{ width: `${b.observed_frequency * 100}%`, background: "var(--accent)" }} />
             </div>
           </div>
         ))}
 
-        <div className="mt-2 flex gap-[18px] text-[10.5px] uppercase tracking-wide" style={{ color: "var(--text-2)" }}>
-          <span>— predicho</span>
-          <span style={{ color: "var(--accent)" }}>— observado</span>
+        <div className="mt-3 flex gap-[18px] text-[11px] uppercase tracking-wide" style={{ color: "var(--text-2)" }}>
+          <span className="flex items-center gap-[6px]">
+            <span className="inline-block h-[5px] w-4 rounded-[3px]" style={{ background: "var(--side-b)" }} />
+            predicho
+          </span>
+          <span className="flex items-center gap-[6px]">
+            <span className="inline-block h-[5px] w-4 rounded-[3px]" style={{ background: "var(--accent)" }} />
+            observado
+          </span>
         </div>
 
         {overall && overall.length > 0 && (
           <>
-            <div className="mb-1 mt-8 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
+            <div className="mb-1 mt-8 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-2)" }}>
               Error de calibración (ECE) — menor es mejor
             </div>
             {overall.map((row) => (

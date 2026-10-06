@@ -3,7 +3,14 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { BottomNav } from "@/components/bottom-nav";
-import { GamePrediction, Target } from "@/lib/types";
+import { GamePrediction, Target, favoriteTeam } from "@/lib/types";
+import { teamColor } from "@/lib/teams";
+
+/** Equipo que ganó el partido (los empates no tienen ganador). */
+function winnerOf(g: GamePrediction): string | null {
+  if (g.home_score == null || g.away_score == null || g.home_score === g.away_score) return null;
+  return g.home_score > g.away_score ? g.home_team : g.away_team;
+}
 
 const TYPE_TABS: { key: Target; label: string }[] = [
   { key: "winner", label: "Ganador" },
@@ -39,9 +46,7 @@ export default function ResultadosPage() {
   const summary = useMemo(() => {
     if (resolved.length === 0) return null;
     if (type === "winner") {
-      const hits = resolved.filter(
-        (g) => (g.probability ?? 0) >= 0.5 === (g.home_score! > g.away_score!)
-      );
+      const hits = resolved.filter((g) => favoriteTeam(g) === winnerOf(g));
       const accuracy = hits.length / resolved.length;
       const brier =
         resolved.reduce((acc, g) => {
@@ -76,7 +81,7 @@ export default function ResultadosPage() {
           <span className="text-[16px] font-bold">Resultados y aciertos</span>
           <select
             className="bg-transparent text-right text-[12px]"
-            style={{ color: "var(--text-2)", colorScheme: "dark" }}
+            style={{ color: "var(--text-2)" }}
             value={week ?? ""}
             onChange={(e) => setWeek(e.target.value ? Number(e.target.value) : undefined)}
           >
@@ -120,7 +125,7 @@ export default function ResultadosPage() {
           <div className="flex gap-[22px] py-5" style={{ borderBottom: "1px solid var(--hair)" }}>
             {summary.map((s) => (
               <div key={s.label} className="flex flex-col gap-1">
-                <span className="text-[10px] uppercase tracking-wide" style={{ color: "var(--text-3)" }}>{s.label}</span>
+                <span className="text-[10px] uppercase tracking-wide" style={{ color: "var(--text-2)" }}>{s.label}</span>
                 <span className="text-[18px] font-bold tabular-nums">{s.value}</span>
               </div>
             ))}
@@ -128,23 +133,32 @@ export default function ResultadosPage() {
         )}
 
         {resolved.map((g) => {
-          const homeWon = g.home_score! > g.away_score!;
-          const hit =
-            type === "winner"
-              ? (g.probability ?? 0) >= 0.5 === homeWon
-              : null;
+          const fav = favoriteTeam(g);
+          const hit = type === "winner" ? fav === winnerOf(g) : null;
           const actual = type === "spread" ? g.actual_margin : type === "total" ? g.actual_total : null;
           return (
-            <div key={g.game_id} className="flex items-center justify-between gap-[10px] py-4" style={{ borderBottom: "1px solid var(--hair-soft)" }}>
+            <div
+              key={g.game_id}
+              className="mt-3 flex items-center justify-between gap-[10px] rounded-[14px] p-[14px]"
+              style={{
+                ...(fav ? ({ "--tint": teamColor(fav) } as React.CSSProperties) : {}),
+                background: "color-mix(in srgb, var(--tint, var(--text-3)) 9%, var(--surface))",
+                border: "1px solid color-mix(in srgb, var(--tint, var(--text-3)) 30%, var(--hair))",
+              }}
+            >
               <div>
                 <div className="text-[14px] font-semibold">{g.away_team} @ {g.home_team}</div>
-                <div className="text-[11px] uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
+                <div className="text-[11px] uppercase tracking-wide" style={{ color: "var(--text-2)" }}>
                   Sem {g.week} · {g.away_score}–{g.home_score}
                 </div>
               </div>
               <div className="shrink-0 text-right">
                 {type === "winner" ? (
-                  <span className="text-[13px] font-semibold" style={{ color: hit ? "var(--text)" : "var(--side-b)" }}>
+                  <span className="text-[13px] font-semibold" style={{ color: "var(--text)" }}>
+                    <span
+                      className="mr-[6px] inline-block h-[8px] w-[8px] rounded-[2px] align-baseline"
+                      style={{ background: hit ? "var(--accent)" : "var(--side-b)" }}
+                    />
                     {hit ? "Acertó" : "Falló"}
                   </span>
                 ) : (
@@ -152,7 +166,7 @@ export default function ResultadosPage() {
                     <div className="text-[13px] font-semibold tabular-nums">
                       pred {(g.point_estimate ?? 0).toFixed(1)}
                     </div>
-                    <div className="text-[11px] tabular-nums" style={{ color: "var(--text-3)" }}>
+                    <div className="text-[11px] tabular-nums" style={{ color: "var(--text-2)" }}>
                       real {actual ?? "—"}
                     </div>
                   </>
