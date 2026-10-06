@@ -119,7 +119,7 @@
 
 :root {
   /* Paleta de producto: tema claro por defecto (contraste AA sobre --bg y
-     --surface); el oscuro sigue prefers-color-scheme. */
+     --surface); el oscuro sigue al sistema o a data-theme en <html>. */
   color-scheme: light;
   --bg: #f3f5f8;
   --surface: #ffffff;
@@ -133,10 +133,34 @@
   --side-b: #2d6591;
   --scrim: rgba(20, 24, 31, 0.45);
   --mix: 11%;
+  /* Selector de tema para teamColor/teamInk (lib/teams.ts): claro. */
+  --tl: initial;
+  --td: ;
 }
 
+/* Oscuro: sigue al sistema salvo que el usuario fije data-theme="light"... */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #0f1216;
+      --surface: #171c23;
+      --hair: #2a313b;
+      --hair-soft: #1f252d;
+      --text: #eceff3;
+      --text-2: #a9b2bf;
+      --text-3: #8a94a3;
+      --accent: #d4a24c;
+      --accent-soft: rgba(212, 162, 76, 0.14);
+      --side-b: #7ea3c6;
+      --scrim: rgba(4, 5, 7, 0.65);
+      --mix: 20%;
+      --tl: ;
+      --td: initial;
+  }
+}
+
+/* ...y data-theme="dark" lo fuerza aunque el sistema sea claro. */
+:root[data-theme="dark"] {
     color-scheme: dark;
     --bg: #0f1216;
     --surface: #171c23;
@@ -150,7 +174,8 @@
     --side-b: #7ea3c6;
     --scrim: rgba(4, 5, 7, 0.65);
     --mix: 20%;
-  }
+    --tl: ;
+    --td: initial;
 }
 
 /* Tipografia de titulares (numeros grandes, equipos). */
@@ -177,7 +202,8 @@
   border-radius: 16px;
 }
 .t-ink {
-  color: color-mix(in srgb, var(--t, #888) 78%, var(--text));
+  /* 52% equipo / 48% texto: >= 4.5:1 sobre .tint-hero en los 32 equipos, claro y oscuro. */
+  color: color-mix(in srgb, var(--t, #888) 52%, var(--text));
 }
 .pbar {
   height: 8px;

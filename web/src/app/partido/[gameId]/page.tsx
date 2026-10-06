@@ -7,7 +7,7 @@ import Link from "next/link";
 import { BottomNav } from "@/components/bottom-nav";
 import { ConfidenceTag, gameTint } from "@/components/game-card";
 import { Cell, GamePlayersTable, PlayerLine, emptyCell } from "@/components/prop-table";
-import { teamColor } from "@/lib/teams";
+import { teamColor, teamInk } from "@/lib/teams";
 import { GamePrediction, PropPrediction, Target, displayProb, pickLabel } from "@/lib/types";
 
 async function fetchGame(gameId: string, target: Target) {
@@ -163,18 +163,19 @@ export default function DetallePage({ params }: { params: Promise<{ gameId: stri
               {factors.length > 0 && (
                 <>
                   <div className="mb-4 flex gap-[18px] text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-2)" }}>
-                    <span style={{ color: teamColor(g.home_team) }}>— {g.home_team}</span>
-                    <span style={{ color: teamColor(g.away_team) }}>— {g.away_team}</span>
+                    <span style={{ color: teamInk(g.home_team) }}>— {g.home_team}</span>
+                    <span style={{ color: teamInk(g.away_team) }}>— {g.away_team}</span>
                   </div>
                   {factors.map((f) => {
                     const side = f.value >= 0 ? "home" : "away";
                     const color = teamColor(side === "home" ? g.home_team : g.away_team);
+                    const ink = teamInk(side === "home" ? g.home_team : g.away_team);
                     const widthPct = (Math.abs(f.value) / maxAbs) * 50;
                     return (
                       <div key={f.label} className="flex flex-col gap-[5px] py-[10px]" style={{ borderBottom: "1px solid var(--hair-soft)" }}>
                         <div className="flex items-baseline justify-between">
                           <span className="text-[12.5px]">{f.label}</span>
-                          <span className="text-[11.5px] font-semibold tabular-nums" style={{ color }}>
+                          <span className="text-[11.5px] font-semibold tabular-nums" style={{ color: ink }}>
                             {f.value >= 0 ? "+" : ""}{f.value.toFixed(3)}
                           </span>
                         </div>

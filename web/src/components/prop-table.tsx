@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment, useState } from "react";
-import { teamColor } from "@/lib/teams";
+import { teamColor, teamInk } from "@/lib/teams";
 import { PropPrediction } from "@/lib/types";
 
 export function TeamDot({ team }: { team: string }) {
@@ -100,7 +100,7 @@ export function PropGroups({ groups, unit }: { groups: GameGroup[]; unit: string
                   hour: "2-digit",
                   minute: "2-digit",
                 })}
-                {g.favorite && <span style={{ color: tint }}> · Favorito {g.favorite}</span>}
+                {g.favorite && <span style={{ color: g.favorite ? teamInk(g.favorite) : undefined }}> · Favorito {g.favorite}</span>}
               </span>
             </div>
             <div className="overflow-x-auto">

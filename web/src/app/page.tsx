@@ -52,7 +52,7 @@ export default function PrediccionesPage() {
   return (
     <div className="flex min-h-screen flex-col pb-[78px]">
       <div className="px-[22px] pt-[env(safe-area-inset-top,0px)]">
-        <div className="flex items-baseline justify-between pt-[22px] pb-[18px]">
+        <div className="flex items-center justify-between gap-3 pt-[22px] pb-[18px]">
           <span className="flex items-center gap-2 text-[16px] font-bold tracking-tight">
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src="/icon.svg" alt="" width={20} height={20} />
@@ -60,7 +60,7 @@ export default function PrediccionesPage() {
           </span>
           <button
             onClick={() => setSheetOpen(true)}
-            className="border-b border-dotted text-[12px]"
+            className="min-w-0 border-b border-dotted text-right text-[12px]"
             style={{ color: "var(--text-2)", borderColor: "var(--text-3)" }}
           >
             {week === "all"

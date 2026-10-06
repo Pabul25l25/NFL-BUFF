@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { ThemeToggle } from "./theme-toggle";
 
 type NavKey = "predicciones" | "resultados" | "calibracion" | "produccion" | "props" | "modelos";
 
@@ -102,6 +103,9 @@ export function BottomNav({ active }: { active: NavKey }) {
           </Link>
         );
       })}
+      <div className="flex w-[52px] shrink-0 items-center justify-center">
+        <ThemeToggle />
+      </div>
     </nav>
   );
 }
