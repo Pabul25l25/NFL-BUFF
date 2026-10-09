@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { ThemeToggle } from "./theme-toggle";
 
-type NavKey = "predicciones" | "resultados" | "calibracion" | "produccion" | "props" | "modelos";
+type NavKey = "predicciones" | "resultados" | "calibracion" | "produccion" | "props" | "picks" | "modelos";
 
 const ITEMS: { key: NavKey; href: string; label: string; icon: React.ReactNode }[] = [
   {
@@ -54,6 +54,17 @@ const ITEMS: { key: NavKey; href: string; label: string; icon: React.ReactNode }
       <>
         <circle cx={8} cy={5} r={2.3} strokeWidth={1.4} />
         <path d="M3.2 13c0.6-2.6 2.6-4 4.8-4s4.2 1.4 4.8 4" strokeWidth={1.4} strokeLinecap="round" />
+      </>
+    ),
+  },
+  {
+    key: "picks",
+    href: "/picks",
+    label: "Picks",
+    icon: (
+      <>
+        <path d="M3 3.5h10v9H3z" strokeWidth={1.3} strokeLinejoin="round" />
+        <path d="M5.5 6.5h5M5.5 9.5h3" strokeWidth={1.3} strokeLinecap="round" />
       </>
     ),
   },

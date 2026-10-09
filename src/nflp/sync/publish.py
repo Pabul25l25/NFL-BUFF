@@ -21,7 +21,6 @@ predicciones locales y el Streamlit ya generados no dependen de esto.
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -43,7 +42,14 @@ _UPSERT_KEYS: dict[str, list[str]] = {
     "weather": ["game_id"],
     "pub_predictions_games": ["game_id", "target"],
     "pub_predictions_props": ["game_id", "gsis_id", "target"],
+    "pub_parlay_game_corr": ["game_id"],
+    "pub_parlay_game_legs": ["game_id"],
+    "pub_parlay_calibration": ["model_id"],
 }
+
+# Props de conteo: la web los modela con Poisson(lambda). Si el modelo no guardó
+# lambda, la media (point_estimate) es el lambda.
+_COUNT_TARGETS = ("receiving_tds", "rushing_tds", "passing_tds", "sacks_suffered")
 
 # Mismo criterio que `dashboard/data._PROP_ACTUAL_COLUMN`: una columna real por
 # cada prop soportado.
@@ -84,19 +90,61 @@ _QUERY_PREDICTIONS_PROPS = f"""
     SELECT p.game_id, p.gsis_id, p.model_id, p.target,
            p.point_estimate, p.lower_80, p.upper_80,
            p.explanation_es, p.shap_values, p.predicted_at, p.as_of_ts,
+           p.quantiles,
+           CASE WHEN p.target IN ({", ".join(repr(t) for t in _COUNT_TARGETS)})
+                THEN COALESCE(p.poisson_lambda, p.point_estimate)
+           END AS poisson_lambda,
            g.season, g.week, g.home_team, g.away_team, g.kickoff_utc,
-           pl.display_name AS player_name, pl.position, s.team,
+           pl.display_name AS player_name, pl.position,
+           -- Equipo/rival/localía: primero lo guardado con la predicción; si falta
+           -- (filas antiguas), features_player (una fila por jugador-partido) y, por
+           -- último, player_stats_weekly (que no tiene filas de partidos sin jugar).
+           COALESCE(p.team, f.team, s.team) AS team,
+           COALESCE(p.opponent_team, f.opponent_team) AS opponent_team,
+           COALESCE(p.is_home, f.is_home) AS is_home,
            {", ".join(f"s.{c}" for c in _PROP_ACTUAL_COLUMNS)}
     FROM predictions p
+    -- predictions guarda filas de modelos anteriores: solo se publica el de producción.
+    JOIN model_registry mr ON mr.model_id = p.model_id AND mr.status = 'production'
     JOIN games g USING (game_id)
     LEFT JOIN players pl ON pl.gsis_id = p.gsis_id
     LEFT JOIN player_stats_weekly s
       ON s.player_id = p.gsis_id AND s.season = g.season AND s.week = g.week
+     AND s.season_type = g.season_type
+    LEFT JOIN (
+        SELECT game_id, gsis_id, team, opponent_team, is_home
+        FROM features_player
+        QUALIFY row_number() OVER (
+            PARTITION BY game_id, gsis_id
+            ORDER BY feature_set_version DESC, as_of_ts DESC
+        ) = 1
+    ) f ON f.game_id = p.game_id AND f.gsis_id = p.gsis_id
     WHERE p.gsis_id IS NOT NULL
     QUALIFY row_number() OVER (
         PARTITION BY p.game_id, p.gsis_id, p.target ORDER BY p.predicted_at DESC
     ) = 1
     ORDER BY p.point_estimate DESC
+"""
+
+# Parlays: último modelo por partido (los dos primeros) y última calibración.
+_QUERY_PARLAY_CORR = """
+    SELECT game_id, model_id, legs, matrix, as_of_ts
+    FROM parlay_game_corr
+    QUALIFY row_number() OVER (PARTITION BY game_id ORDER BY as_of_ts DESC) = 1
+"""
+
+_QUERY_PARLAY_LEGS = """
+    SELECT game_id, model_id, p_home_win, margin_mu, margin_sigma,
+           total_mu, total_sigma, as_of_ts
+    FROM parlay_game_legs
+    QUALIFY row_number() OVER (PARTITION BY game_id ORDER BY as_of_ts DESC) = 1
+"""
+
+_QUERY_PARLAY_CALIBRATION = """
+    SELECT model_id, ece, logloss, ece_independent, logloss_independent, n, created_at
+    FROM parlay_calibration
+    ORDER BY created_at DESC
+    LIMIT 1
 """
 
 
@@ -263,6 +311,21 @@ def _publish_flattened_views(local: Database, cloud: Database, report: PublishRe
         key_columns=_UPSERT_KEYS["pub_predictions_props"],
     )
     report.add("pub_predictions_props", rows)
+
+    for table, query in (
+        ("pub_parlay_game_corr", _QUERY_PARLAY_CORR),
+        ("pub_parlay_game_legs", _QUERY_PARLAY_LEGS),
+        ("pub_parlay_calibration", _QUERY_PARLAY_CALIBRATION),
+    ):
+        source = table.removeprefix("pub_")
+        if not local.table_exists(source):
+            log.debug("Tabla local '%s' no existe todavía; se omite.", source)
+            continue
+        frame = local.query(query)
+        if frame.empty:
+            continue
+        rows = cloud.write_df(frame, table, mode="upsert", key_columns=_UPSERT_KEYS[table])
+        report.add(table, rows)
 
 
 def _touch_sync_meta(cloud: Database, report: PublishReport) -> None:

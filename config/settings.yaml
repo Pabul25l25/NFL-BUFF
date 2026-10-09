@@ -37,7 +37,7 @@ weather:
 
 features:
   # Versión del conjunto de features. Cambiarla invalida el feature store.
-  version: v1
+  version: v2
   # Ventanas de medias móviles (en partidos) para métricas de equipo.
   rolling_windows: [3, 5, 8]
   # Peso del decaimiento exponencial para la forma reciente.

@@ -333,8 +333,12 @@ def model_train(
 @model_app.command("train-props")
 def model_train_props(
     target: str = typer.Option("all", "--target", help="receiving_yards | rushing_yards | all"),
+    promote_if_better: bool = typer.Option(
+        False, "--promote-if-better",
+        help="Promueve el shadow si mejora MAE y CRPS de producción con cobertura 80% en [0,75; 0,85].",
+    ),
 ) -> None:
-    """Entrena los modelos de props de jugador."""
+    """Entrena los modelos de props de jugador (quedan en shadow)."""
     from nflp.agents.modeling.props_agent import PropsAgent
 
     agent = PropsAgent()
@@ -342,12 +346,24 @@ def model_train_props(
 
     for name in targets:
         model = agent.train(name)
+        m = model.metrics
         console.print(
-            f"[bold cyan]{name}[/bold cyan] · familia {model.family} · "
-            f"MAE val = [bold]{model.metrics['val_mae']:.2f}[/bold] · "
-            f"CRPS = {model.metrics['val_crps']:.2f} · "
-            f"pseudo-labeling: {'sí' if model.used_pseudo_labels else 'no'}"
+            f"[bold cyan]{name}[/bold cyan] · {model.family}/{model.objective} · "
+            f"MAE train = {m['train_mae']:.3f} · MAE val = [bold]{m['val_mae']:.3f}[/bold] · "
+            f"brecha = {m.get('train_val_gap', float('nan')):+.1%} · "
+            f"CRPS = {m['val_crps']:.3f} · cobertura80 = {m['val_coverage_80']:.3f} · "
+            f"sesgo = {m['val_bias']:+.3f}"
         )
+        if "prod_val_mae" in m:
+            console.print(
+                f"  producción (mismas filas): MAE = {m['prod_val_mae']:.3f} · "
+                f"CRPS = {m['prod_val_crps']:.3f} · cobertura80 = {m['prod_val_coverage_80']:.3f} · "
+                f"sesgo = {m['prod_val_bias']:+.3f}"
+            )
+        if promote_if_better:
+            promoted, reason = agent.promote_if_better(name, model)
+            colour = "green" if promoted else "yellow"
+            console.print(f"  [{colour}]{'Promovido' if promoted else 'Sigue en shadow'}: {reason}[/{colour}]")
 
 
 @backtest_app.command("props")
@@ -355,17 +371,64 @@ def backtest_props(
     target: str = typer.Option("all", "--target", help="receiving_yards | rushing_yards | all"),
     from_season: int = typer.Option(None, "--from"),
     to_season: int = typer.Option(None, "--to"),
+    report: bool = typer.Option(True, "--report/--no-report", help="Escribe data/reports/props_backtest.md y .csv."),
 ) -> None:
-    """Valida los props con walk-forward y compara las variantes."""
-    from nflp.agents.modeling.props_agent import PropsAgent
+    """Valida los props con walk-forward: nuevo vs actual vs media de 5 partidos."""
+    from nflp.agents.modeling.props_agent import PropsAgent, write_backtest_report
 
     agent = PropsAgent()
     targets = agent.settings.props.targets if target == "all" else [target]
 
+    results = []
     for name in targets:
         result = agent.backtest(name, start_season=from_season, end_season=to_season)
+        results.append(result)
         console.print(f"\n[bold cyan]Prop: {name}[/bold cyan] ({result.n_rows:,} predicciones)")
         console.print(result.comparison.to_string(index=False))
+
+    if report and results:
+        md_path, csv_path = write_backtest_report(results, agent.settings.paths.reports_dir)
+        console.print(f"\nInforme: {md_path} · {csv_path}")
+
+
+@model_app.command("parlay-corr")
+def model_parlay_corr(
+    test_seasons: str = typer.Option(
+        "2023,2024,2025", "--test-seasons", help="Temporadas de prueba del backtest de calibración."
+    ),
+    parlays_per_game: int = typer.Option(40, "--parlays-per-game", help="Parlays sintéticos por partido."),
+    sims: int = typer.Option(20000, "--sims", help="Simulaciones Monte Carlo por partido."),
+    refresh: bool = typer.Option(False, "--refresh", help="Recalcula las predicciones fuera de muestra."),
+    predict_upcoming: bool = typer.Option(
+        True, "--predict/--no-predict", help="Genera las matrices de los próximos partidos."
+    ),
+) -> None:
+    """Ajusta la cópula de parlays del mismo partido, la calibra (walk-forward) y la sirve."""
+    from nflp.agents.modeling.parlay import ParlayAgent, sanity_pairs, write_parlay_report
+
+    agent = ParlayAgent()
+    seasons = _parse_seasons(test_seasons)
+    result = agent.fit(test_seasons=seasons, n_per_game=parlays_per_game, n_sims=sims, refresh=refresh)
+    report = write_parlay_report(
+        result, agent.settings.paths.reports_dir / "parlay_calibration.md",
+        n_sims=sims, n_per_game=parlays_per_game,
+    )
+    m = result.metrics
+    console.print(
+        f"[bold cyan]Parlays[/bold cyan] ({m['n']:,} sintéticos, temporadas {seasons}) · "
+        f"ECE cópula = [bold]{m['ece']:.4f}[/bold] vs indep = {m['ece_independent']:.4f} · "
+        f"log loss cópula = [bold]{m['logloss']:.4f}[/bold] vs indep = {m['logloss_independent']:.4f}"
+    )
+    colour = "green" if result.publish_correlated else "yellow"
+    console.print(
+        f"[{colour}]Modelo {result.model_id} -> {result.model.kind}"
+        f"{'' if result.publish_correlated else ' (la cópula no mejora a la independencia)'}[/{colour}]"
+    )
+    console.print(sanity_pairs(result.model).to_string(index=False))
+    console.print(f"Informe: {report}")
+    if predict_upcoming:
+        legs, corr = agent.predict(model=(result.model_id, result.model))
+        console.print(f"Matrices de parlay: {len(corr)} partidos · piernas de partido: {len(legs)}")
 
 
 @model_app.command("list")
@@ -437,7 +500,9 @@ def model_rollback(
 def predict(
     season: int = typer.Option(None, "--season", help="Temporada a predecir."),
     week: int = typer.Option(None, "--week", help="Semana a predecir."),
-    target: str = typer.Option("all", "--target", help="winner | spread | total | props | all"),
+    target: str = typer.Option(
+        "all", "--target", help="winner | spread | total | props | parlay | all"
+    ),
     shadow: bool = typer.Option(False, "--shadow", help="Usa el modelo en shadow."),
 ) -> None:
     """Genera predicciones con justificación SHAP y las persiste con trazabilidad."""
@@ -453,6 +518,8 @@ def predict(
         selected_games, selected_props = [], prop_targets
     elif target in prop_targets:
         selected_games, selected_props = [], [target]
+    elif target == "parlay":
+        selected_games, selected_props = [], []
     else:
         selected_games, selected_props = [target], []
 
@@ -469,6 +536,20 @@ def predict(
             console.print(f"[yellow]Sin proyecciones para '{name}'.[/yellow]")
             continue
         _show_prop_predictions(batch)
+
+    # La matriz de parlay se arma con las predicciones de props y de partido ya
+    # persistidas, así que va al final.
+    if target in {"all", "parlay"}:
+        from nflp.agents.modeling.parlay import ParlayAgent
+
+        legs, corr = ParlayAgent(predictor.settings, predictor.db).predict(season=season, week=week)
+        if corr.empty:
+            console.print("[yellow]Sin matrices de parlay (¿falta `nflp model parlay-corr`?).[/yellow]")
+        else:
+            console.print(
+                f"Parlay: {len(corr)} partidos con matriz de correlación · "
+                f"{len(legs)} con piernas de partido."
+            )
 
 
 def _show_game_predictions(batch: object) -> None:

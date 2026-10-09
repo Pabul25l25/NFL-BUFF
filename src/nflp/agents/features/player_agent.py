@@ -14,8 +14,8 @@ import pandas as pd
 
 from nflp.agents.data.normalize import is_closed_roof
 from nflp.agents.data.weather import is_adverse_weather
-from nflp.agents.features.injuries import player_injury_status
-from nflp.agents.features.player_form import build_player_form
+from nflp.agents.features.contracts import audit_features
+from nflp.agents.features.player_form import PLAYER_EWM_HALFLIFE, build_player_form
 from nflp.agents.features.team_form import build_team_form
 from nflp.core.config import Settings, get_settings
 from nflp.core.db import Database, get_db
@@ -52,7 +52,15 @@ class PlayerFeatureAgent:
         # El esqueleto de features parte del róster, no de las estadísticas: así
         # se pueden proyectar props de partidos futuros (ver player_form.py).
         rosters = self.db.query("SELECT * FROM rosters_weekly")
-        players = self.db.query("SELECT gsis_id, display_name FROM players")
+        # Metadatos estáticos del catálogo. `pfr_id` solo si la ingesta lo trae:
+        # con él el cruce de snaps es por id oficial; sin él, se infiere.
+        player_columns = set(self.db.get_columns("players"))
+        wanted = [
+            c for c in ("gsis_id", "display_name", "draft_round", "rookie_season", "pfr_id")
+            if c in player_columns
+        ]
+        players = self.db.query(f"SELECT {', '.join(wanted)} FROM players")
+        injuries = self.db.query("SELECT * FROM injuries")
 
         if rosters.empty:
             log.warning("Sin datos de róster; se omite el feature store de props.")
@@ -64,25 +72,18 @@ class PlayerFeatureAgent:
             halflife=settings.features.ewm_halflife,
         )
 
+        # El corte as-of (kickoff - offset) y el parte de lesiones as-of se
+        # resuelven dentro de build_player_form: el QB titular esperado, el rango
+        # de profundidad y la oportunidad vacante dependen de ellos.
         frame = build_player_form(
             player_stats, games, snap_counts, team_form, rosters, players,
             window=settings.props.usage_window,
+            injuries=injuries,
+            as_of_offset_hours=settings.features.as_of_offset_hours,
+            ewm_halflife=PLAYER_EWM_HALFLIFE,
         )
         if frame.empty:
             return frame
-
-        # --- corte as-of ---
-        offset = pd.Timedelta(hours=settings.features.as_of_offset_hours)
-        frame["as_of_ts"] = frame["kickoff_utc"] - offset
-
-        # --- estado de lesión con corte as-of ---
-        injuries = self.db.query("SELECT * FROM injuries")
-        status = player_injury_status(
-            injuries, frame[["game_id", "season", "week", "as_of_ts", "gsis_id"]]
-        )
-        frame = frame.merge(status, on=["game_id", "gsis_id"], how="left")
-        frame["injury_status_code"] = frame["injury_status_code"].fillna(0).astype(int)
-        frame["practice_status_code"] = frame["practice_status_code"].fillna(0).astype(int)
 
         # --- contexto de partido: descanso, clima, techo ---
         frame = self._attach_game_context(frame, games)
@@ -132,6 +133,13 @@ class PlayerFeatureAgent:
         output = output.drop_duplicates(
             subset=["game_id", "gsis_id", "feature_set_version"], keep="last"
         )
+
+        # Auditoría anti-leakage antes de escribir nada (mismo contrato que el
+        # feature store de partido).
+        report = audit_features(output, kickoff=frame.loc[output.index, "kickoff_utc"])
+        if not report.is_clean:
+            raise RuntimeError(report.describe())
+        log.info(report.describe())
 
         rows = self.db.write_df(
             output, "features_player", mode="upsert",

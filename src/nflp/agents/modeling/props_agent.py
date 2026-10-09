@@ -3,25 +3,47 @@
 Mantiene la misma disciplina que los modelos de partido: corte temporal,
 walk-forward, calibración fuera de muestra y gate de promoción.
 
-La evaluación usa **CRPS** además de MAE. El CRPS mide la calidad de toda la
-distribución predictiva, que es lo que realmente se usa: un prop se resuelve
-contra una línea, así que un modelo que acierta la media pero se equivoca en la
-dispersión produce probabilidades over/under malas aunque su MAE sea bueno.
+La evaluación usa **CRPS** además de MAE, y el CRPS puntúa la distribución que
+realmente se sirve: rejilla de cuantiles p05..p95 para los continuos, Poisson
+exacta para los conteos (ver ``distributions.py``). Un modelo que acierta la
+media pero se equivoca en la dispersión produce probabilidades over/under malas
+aunque su MAE sea bueno. Además se mide la **cobertura del 80 %** (literal en
+continuos, PIT aleatorizado en conteos) y el **sesgo** medio.
 """
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
+import numpy as np
 import pandas as pd
 
-from nflp.agents.backtesting.metrics import crps_gaussian, regression_metrics
+from nflp.agents.backtesting.metrics import regression_metrics
+from nflp.agents.modeling.distributions import (
+    P10_INDEX,
+    P90_INDEX,
+    QUANTILE_LEVELS,
+    PoissonDistribution,
+    crps_poisson_rows,
+    crps_quantile_grid_rows,
+    interval_coverage,
+    randomized_pit_covered,
+)
 from nflp.agents.modeling.props import (
     PROP_FEATURE_SETS,
+    PROP_MIN_TRAIN_SEASON,
+    QUANTILE_LOWER_BOUND,
+    SPARSE_COUNT_PROPS,
     PropModel,
-    empirical_bayes_shrinkage,
     filter_prop_rows,
+    served_coverage,
+    served_crps,
+    served_crps_rows,
+    served_interval,
+    served_quantiles,
     train_prop_model,
 )
 from nflp.core.config import Settings, get_settings
@@ -30,6 +52,9 @@ from nflp.core.logging import get_logger
 from nflp.registry import ModelRecord, ModelRegistry
 
 log = get_logger(__name__)
+
+# Banda de cobertura del 80 % exigida para promover un prop.
+COVERAGE_BAND: tuple[float, float] = (0.75, 0.85)
 
 
 @dataclass
@@ -40,6 +65,72 @@ class PropBacktestResult:
     comparison: pd.DataFrame
     predictions: pd.DataFrame
     n_rows: int
+    by_season: pd.DataFrame | None = None
+
+
+def score_rows(
+    y: np.ndarray,
+    point: np.ndarray,
+    crps: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    covered: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Métricas por fila: error, CRPS y cobertura del 80 %.
+
+    ``covered`` permite pasar la cobertura por PIT aleatorizado (Poisson); si
+    no se pasa, se usa la cobertura literal del intervalo.
+    """
+    y = np.asarray(y, dtype=float)
+    point = np.asarray(point, dtype=float)
+    literal = ((y >= lower) & (y <= upper)).astype(float)
+    return pd.DataFrame(
+        {
+            "y_true": y, "y_pred": point, "lower_80": lower, "upper_80": upper,
+            "abs_err": np.abs(y - point), "sq_err": (y - point) ** 2,
+            "err": point - y, "crps": crps,
+            "covered_80": literal if covered is None else covered,
+            "covered_literal": literal,
+        }
+    )
+
+
+def aggregate_scores(rows: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+    grouped = rows.groupby(by, dropna=False)
+    out = grouped.agg(
+        n=("y_true", "size"),
+        mae=("abs_err", "mean"),
+        rmse=("sq_err", lambda s: float(np.sqrt(s.mean()))),
+        bias=("err", "mean"),
+        crps=("crps", "mean"),
+        coverage_80=("covered_80", "mean"),
+        coverage_literal=("covered_literal", "mean"),
+        mean_pred=("y_pred", "mean"),
+        mean_true=("y_true", "mean"),
+    )
+    return out.reset_index()
+
+
+def evaluate_candidate(
+    candidate: dict[str, float], production: dict[str, float] | None
+) -> tuple[bool, str]:
+    """Regla de promoción de props: MAE **y** CRPS mejoran y cobertura en banda."""
+    coverage = candidate.get("val_coverage_80", float("nan"))
+    low, high = COVERAGE_BAND
+    if not (low <= coverage <= high):
+        return False, f"cobertura 80% en validación {coverage:.3f} fuera de [{low}, {high}]"
+    if not production:
+        return True, "sin modelo de producción con el que comparar"
+    mae_ok = candidate["val_mae"] < production["val_mae"]
+    crps_ok = candidate["val_crps"] < production["val_crps"]
+    detail = (
+        f"MAE {candidate['val_mae']:.4f} vs {production['val_mae']:.4f}, "
+        f"CRPS {candidate['val_crps']:.4f} vs {production['val_crps']:.4f}, "
+        f"cobertura {coverage:.3f}"
+    )
+    if mae_ok and crps_ok:
+        return True, "mejora MAE y CRPS: " + detail
+    return False, "no mejora MAE y CRPS a la vez: " + detail
 
 
 class PropsAgent:
@@ -52,11 +143,15 @@ class PropsAgent:
 
     # ------------------------------------------------------------------ datos
 
-    def load_dataset(self, target: str, seasons: list[int] | None = None) -> pd.DataFrame:
+    def load_dataset(
+        self, target: str, seasons: list[int] | None = None, *, min_season: int | None = None
+    ) -> pd.DataFrame:
         """Une el feature store de jugador con el resultado real del prop."""
-        clause = ""
+        clauses = []
         if seasons:
-            clause = f"AND f.season IN ({', '.join(str(s) for s in seasons)})"
+            clauses.append(f"AND f.season IN ({', '.join(str(int(s)) for s in seasons)})")
+        if min_season is not None:
+            clauses.append(f"AND f.season >= {int(min_season)}")
 
         frame = self.db.query(
             f"""
@@ -68,7 +163,7 @@ class PropsAgent:
             JOIN games g ON g.game_id = f.game_id
             WHERE f.feature_set_version = '{self.settings.features.version}'
               AND s.{target} IS NOT NULL
-              {clause}
+              {' '.join(clauses)}
             ORDER BY g.kickoff_utc
             """
         )
@@ -97,160 +192,179 @@ class PropsAgent:
         end_season: int | None = None,
         compare_semisupervised: bool = True,
     ) -> PropBacktestResult:
-        """Valida el prop con walk-forward y compara las variantes.
+        """Walk-forward por temporada: nuevo vs actual vs media de 5 partidos.
 
-        Compara tres enfoques:
-        1. **Base** — solo jugadores de muestra amplia.
-        2. **Pseudo-labeling** — el semi-supervisado que pide el prompt.
-        3. **Shrinkage empírico-Bayes** — el control metodológico.
+        Para cada temporada evaluada ``S``:
+
+        * **nuevo** — features v2, entrenado en ``[2016, S−2]``, distribución
+          calibrada en ``S−1``.
+        * **actual** — el modelo de producción v1 (features v1, L1/L2,
+          pseudo-labeling, log-normal global) entrenado en ``< S−1`` y con la
+          log-normal ajustada en ``S−1``.
+        * **media_5_partidos** — ``{target}_r5`` como punto; Poisson(r5) en
+          conteos y ``r5 + cuantiles de residuos de S−1`` en continuos.
+
+        Todas las variantes se puntúan con las mismas métricas (CRPS de la
+        distribución servida, cobertura del 80 %, sesgo).
         """
         config = self.settings.backtest
-        start = start_season or config.start_season
-        end = end_season or config.end_season
-
         frame = self.load_dataset(target)
-        seasons = sorted(frame["season"].unique())
-        evaluable = [
-            s for s in seasons
-            if start <= s <= end and s - min(seasons) >= config.min_train_seasons
-        ]
+        seasons = sorted(int(s) for s in frame["season"].unique())
+        first = PROP_MIN_TRAIN_SEASON + config.min_train_seasons + 1
+        start = max(start_season or first, first)
+        end = end_season or max(seasons)
+        evaluable = [s for s in seasons if start <= s <= end]
         if not evaluable:
             raise ValueError(f"Sin temporadas evaluables para el prop '{target}'.")
 
-        variants = {"base": False}
-        if compare_semisupervised:
-            variants["pseudo_labeling"] = True
-
-        collected: dict[str, list[pd.DataFrame]] = {name: [] for name in variants}
+        is_count = target in SPARSE_COUNT_PROPS
+        recent = f"{target}_r5"
+        lower_bound = QUANTILE_LOWER_BOUND.get(target, 0.0)
+        seed = self.settings.modeling.random_seed
+        blocks: list[pd.DataFrame] = []
 
         for season in evaluable:
-            train = frame[frame["season"] < season]
             test = frame[frame["season"] == season]
-            if len(train) < 1000 or test.empty:
+            calib = frame[frame["season"] == season - 1]
+            if test.empty or calib.empty:
                 continue
+            meta = test[["game_id", "gsis_id", "season", "week", "position", "team"]].reset_index(drop=True)
+            y = test[target].astype(float).to_numpy()
 
-            # Última temporada del bloque de entrenamiento: calibración.
-            calib_season = sorted(train["season"].unique())[-1]
-            fit = train[train["season"] < calib_season]
-            calib = train[train["season"] == calib_season]
-            if fit.empty or calib.empty:
-                fit, calib = train, train.tail(0)
+            # --- nuevo ---
+            fit_new = frame[(frame["season"] >= PROP_MIN_TRAIN_SEASON) & (frame["season"] < season - 1)]
+            new = train_prop_model(fit_new, calib, target, random_state=seed)
+            point = new.predict(test)
+            lower, upper = new.interval(test, point)
+            crps = served_crps_rows(new.distribution, y, point, test)
+            covered = randomized_pit_covered(y, point) if is_count else None
+            blocks.append(meta.join(score_rows(y, point, crps, lower, upper, covered)).assign(variant="nuevo"))
 
-            for name, use_pseudo in variants.items():
-                model = train_prop_model(
-                    fit, calib, target,
-                    random_state=self.settings.modeling.random_seed,
-                    use_pseudo_labels=use_pseudo,
-                )
-                prediction = model.predict(test)
-                block = test[["game_id", "gsis_id", "season", "week", "position", "team"]].copy()
-                block["y_true"] = test[target].to_numpy()
-                block["y_pred"] = prediction
-                block["y_std"] = model.distribution.std(prediction)
-                block["variant"] = name
-                collected[name].append(block)
+            # --- actual (v1) ---
+            fit_old = frame[frame["season"] < season - 1]
+            old = train_prop_model(fit_old, calib, target, legacy=True, random_state=seed)
+            point = old.predict(test)
+            lower, upper = old.interval(test, point)
+            # El modelo actual sirve una log-normal también en conteos; en ellos se
+            # puntúa con el CRPS casi exacto (rejilla fina) para compararlo con la
+            # Poisson exacta del nuevo.
+            crps = served_crps_rows(old.distribution, y, point, test, exact=is_count)
+            blocks.append(meta.join(score_rows(y, point, crps, lower, upper)).assign(variant="actual"))
+
+            # --- media de 5 partidos ---
+            point = np.maximum(test[recent].astype(float).fillna(0.0).to_numpy(), 0.0)
+            if is_count:
+                lower, upper = PoissonDistribution().interval(point)
+                crps = crps_poisson_rows(y, point)
+                covered = randomized_pit_covered(y, point)
+            else:
+                from nflp.agents.modeling.props_tuning import residual_grid
+
+                calib_point = np.maximum(calib[recent].astype(float).fillna(0.0).to_numpy(), 0.0)
+                grid = residual_grid(calib_point, calib[target].astype(float).to_numpy(), point, lower_bound)
+                lower, upper = grid[:, P10_INDEX], grid[:, P90_INDEX]
+                crps = crps_quantile_grid_rows(y, grid)
+                covered = None
+            blocks.append(meta.join(score_rows(y, point, crps, lower, upper, covered))
+                          .assign(variant="media_5_partidos"))
 
             log.info("  prop '%s' temporada %d validada (%d filas).", target, season, len(test))
 
-        rows: list[dict] = []
-        all_predictions: list[pd.DataFrame] = []
-
-        for name, blocks in collected.items():
-            if not blocks:
-                continue
-            predictions = pd.concat(blocks, ignore_index=True)
-            all_predictions.append(predictions)
-
-            metrics = regression_metrics(predictions["y_true"], predictions["y_pred"])
-            crps = crps_gaussian(
-                predictions["y_true"].to_numpy(),
-                predictions["y_pred"].to_numpy(),
-                predictions["y_std"].to_numpy(),
-            )
-            rows.append(
-                {
-                    "variante": name, "n": metrics.n,
-                    "mae": round(metrics.mae, 3), "rmse": round(metrics.rmse, 3),
-                    "crps": round(crps, 3),
-                }
-            )
-
-        # --- control: shrinkage empírico-Bayes sobre la media reciente ---
-        if all_predictions:
-            baseline = all_predictions[0].copy()
-            recent = f"{target}_r5"
-            source = self.load_dataset(target)[["game_id", "gsis_id", recent, "games_played_prior", "position"]]
-            merged = baseline.merge(source, on=["game_id", "gsis_id"], how="left", suffixes=("", "_s"))
-
-            shrunk = empirical_bayes_shrinkage(
-                merged[recent], merged["position_s"].fillna(merged["position"]),
-                merged["games_played_prior"],
-            )
-            metrics = regression_metrics(merged["y_true"], shrunk)
-            rows.append(
-                {
-                    "variante": "control_shrinkage_eb", "n": metrics.n,
-                    "mae": round(metrics.mae, 3), "rmse": round(metrics.rmse, 3),
-                    "crps": None,
-                }
-            )
-
-            naive = regression_metrics(merged["y_true"], merged[recent])
-            rows.append(
-                {
-                    "variante": "baseline_media_5_partidos", "n": naive.n,
-                    "mae": round(naive.mae, 3), "rmse": round(naive.rmse, 3), "crps": None,
-                }
-            )
-
-        comparison = pd.DataFrame(rows).sort_values("mae")
-        predictions = pd.concat(all_predictions, ignore_index=True) if all_predictions else pd.DataFrame()
+        predictions = pd.concat(blocks, ignore_index=True)
+        predictions["target"] = target
+        comparison = aggregate_scores(predictions, ["variant"]).sort_values("crps")
+        by_season = aggregate_scores(predictions, ["variant", "season"])
+        comparison.insert(0, "target", target)
+        by_season.insert(0, "target", target)
 
         return PropBacktestResult(
-            target=target, comparison=comparison,
-            predictions=predictions, n_rows=len(predictions),
+            target=target, comparison=comparison, predictions=predictions,
+            n_rows=int((predictions["variant"] == "nuevo").sum()), by_season=by_season,
         )
 
     # --------------------------------------------------------------- entrenar
 
-    def train(
-        self, target: str, *, val_seasons: int = 2, register: bool = True
-    ) -> PropModel:
-        """Entrena el modelo final de un prop y lo registra."""
-        frame = self.load_dataset(target)
+    def _split(self, frame: pd.DataFrame, val_seasons: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         seasons = sorted(frame["season"].unique())
         if len(seasons) < 4:
-            raise ValueError(f"Se necesitan al menos 4 temporadas para el prop '{target}'.")
-
+            raise ValueError("Se necesitan al menos 4 temporadas para un prop.")
         val_cutoff = seasons[-val_seasons]
         calib_cutoff = seasons[-(val_seasons + 1)]
-
         fit = frame[frame["season"] < calib_cutoff]
         calib = frame[(frame["season"] >= calib_cutoff) & (frame["season"] < val_cutoff)]
         validation = frame[frame["season"] >= val_cutoff]
+        return fit, calib, validation
 
-        model = train_prop_model(
-            fit, calib, target,
-            random_state=self.settings.modeling.random_seed,
-            use_pseudo_labels=True,
-        )
+    def evaluate_artifact(self, artifact: dict[str, Any], validation: pd.DataFrame) -> dict[str, float]:
+        """Métricas de un artefacto registrado sobre filas de validación dadas."""
+        target = artifact["target"]
+        X = validation.reindex(columns=artifact["feature_names"]).astype(float)
+        point = np.maximum(artifact["model"].predict(X), 0.0)
+        distribution = artifact["distribution"]
+        y = validation[target].astype(float).to_numpy()
+        metrics = regression_metrics(y, point)
+        lower, upper = served_interval(distribution, point, validation)
+        return {
+            "val_mae": metrics.mae,
+            "val_rmse": metrics.rmse,
+            "val_bias": float(np.mean(point - y)),
+            "val_crps": served_crps(
+                distribution, y, point, validation, exact=target in SPARSE_COUNT_PROPS
+            ),
+            "val_coverage_80": served_coverage(distribution, y, point, validation),
+            "val_coverage_literal": interval_coverage(y, lower, upper),
+            "n_val": float(len(validation)),
+        }
+
+    def train(
+        self,
+        target: str,
+        *,
+        val_seasons: int = 2,
+        register: bool = True,
+        min_season: int | None = PROP_MIN_TRAIN_SEASON,
+    ) -> PropModel:
+        """Entrena el modelo final de un prop y lo registra en shadow.
+
+        Corte temporal: entrenamiento ``[2016, T−3]``, calibración de la
+        distribución en ``T−2`` y validación en las dos últimas temporadas.
+        """
+        frame = self.load_dataset(target, min_season=min_season)
+        fit, calib, validation = self._split(frame, val_seasons)
+
+        model = train_prop_model(fit, calib, target, random_state=self.settings.modeling.random_seed)
 
         train_pred = model.predict(fit)
         val_pred = model.predict(validation)
         train_metrics = regression_metrics(fit[target], train_pred)
         val_metrics = regression_metrics(validation[target], val_pred)
+        y_val = validation[target].astype(float).to_numpy()
+        lower, upper = model.interval(validation, val_pred)
 
-        crps = crps_gaussian(
-            validation[target].to_numpy(), val_pred, model.distribution.std(val_pred)
-        )
         model.metrics = {
-            "train_mae": train_metrics.mae, "val_mae": val_metrics.mae,
-            "val_rmse": val_metrics.rmse, "val_crps": crps,
+            "train_mae": train_metrics.mae,
+            "val_mae": val_metrics.mae,
+            "val_rmse": val_metrics.rmse,
+            "val_bias": float(np.mean(val_pred - y_val)),
+            "val_crps": served_crps(
+                model.distribution, y_val, val_pred, validation, exact=target in SPARSE_COUNT_PROPS
+            ),
+            "val_coverage_80": served_coverage(model.distribution, y_val, val_pred, validation),
+            "val_coverage_literal": interval_coverage(y_val, lower, upper),
+            "calib_coverage_80": float(getattr(model.distribution, "calibration_coverage", np.nan)),
         }
 
+        # La producción vigente, puntuada sobre exactamente las mismas filas y
+        # con el mismo CRPS: la comparación de promoción es manzanas con manzanas.
+        production = self.registry.load_production(target)
+        if production is not None:
+            prod_metrics = self.evaluate_artifact(production[1], validation)
+            model.metrics.update({f"prod_{k}": v for k, v in prod_metrics.items()})
+
         log.info(
-            "Prop '%s': MAE train=%.2f val=%.2f · RMSE=%.2f · CRPS=%.2f",
-            target, train_metrics.mae, val_metrics.mae, val_metrics.rmse, crps,
+            "Prop '%s' (%s): MAE train=%.3f val=%.3f · CRPS=%.3f · cobertura80=%.3f · sesgo=%+.3f",
+            target, model.objective, train_metrics.mae, val_metrics.mae,
+            model.metrics["val_crps"], model.metrics["val_coverage_80"], model.metrics["val_bias"],
         )
 
         if register:
@@ -266,7 +380,13 @@ class PropsAgent:
                 version=self.registry.next_version(target),
                 feature_set_version=self.settings.features.version,
                 feature_names=model.feature_names,
-                hyperparameters={"pseudo_labels": model.used_pseudo_labels},
+                hyperparameters={
+                    "pseudo_labels": model.used_pseudo_labels,
+                    "objective": model.objective,
+                    "distribution": model.distribution_kind,
+                    "min_train_season": min_season,
+                    **{k: v for k, v in model.params.items() if k not in {"verbose", "n_jobs"}},
+                },
                 dataset_hash="",
                 train_seasons=f"{fit['season'].min()}-{fit['season'].max()}",
                 n_train_rows=len(fit),
@@ -282,6 +402,9 @@ class PropsAgent:
                 {
                     "model": model.model,
                     "distribution": model.distribution,
+                    "distribution_kind": model.distribution_kind,
+                    "quantile_levels": list(QUANTILE_LEVELS),
+                    "objective": model.objective,
                     "feature_names": model.feature_names,
                     "target": target,
                     "kind": "prop",
@@ -289,12 +412,106 @@ class PropsAgent:
                 },
                 decision=decision,
             )
+            model.metrics["train_val_gap"] = record.train_val_gap
+            self._last_record = record
 
         return model
+
+    def promote_if_better(self, target: str, model: PropModel) -> tuple[bool, str]:
+        """Promueve el último shadow registrado si mejora a producción (ver ``evaluate_candidate``)."""
+        record = getattr(self, "_last_record", None)
+        if record is None or record.target != target:
+            return False, "no hay modelo recién registrado para este target"
+        if record.status != "shadow":
+            return False, f"el modelo quedó en estado '{record.status}' (gate de brecha)"
+        production = None
+        if "prod_val_mae" in model.metrics:
+            production = {
+                k.removeprefix("prod_"): v for k, v in model.metrics.items() if k.startswith("prod_")
+            }
+        allowed, reason = evaluate_candidate(model.metrics, production)
+        if allowed:
+            self.registry.promote(record.model_id, reason=f"props v2: {reason}")
+        log.info("Promoción de '%s': %s — %s", target, "SÍ" if allowed else "NO", reason)
+        return allowed, reason
 
     def train_all(self) -> list[PropModel]:
         return [self.train(target) for target in self.settings.props.targets]
 
 
+def write_backtest_report(results: list[PropBacktestResult], directory: Path) -> tuple[Path, Path]:
+    """Escribe ``props_backtest.md`` y ``props_backtest.csv`` (global y por temporada)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    overall = pd.concat([r.comparison.assign(season="all") for r in results], ignore_index=True)
+    seasons = pd.concat([r.by_season for r in results if r.by_season is not None], ignore_index=True)
+    table = pd.concat([overall, seasons], ignore_index=True)
+    columns = ["target", "variant", "season", "n", "mae", "rmse", "bias", "crps",
+               "coverage_80", "coverage_literal", "mean_pred", "mean_true"]
+    table = table[columns]
+    csv_path = directory / "props_backtest.csv"
+    table.to_csv(csv_path, index=False, float_format="%.4f")
+
+    def fmt(frame: pd.DataFrame) -> str:
+        shown = frame.copy()
+        for column in ("mae", "rmse", "bias", "crps", "mean_pred", "mean_true"):
+            shown[column] = shown[column].map(lambda v: f"{v:.3f}")
+        for column in ("coverage_80", "coverage_literal"):
+            shown[column] = shown[column].map(lambda v: f"{v:.3f}")
+        header = "| " + " | ".join(shown.columns) + " |"
+        sep = "|" + "|".join("---" for _ in shown.columns) + "|"
+        body = ["| " + " | ".join(str(v) for v in row) + " |" for row in shown.itertuples(index=False)]
+        return "\n".join([header, sep, *body])
+
+    lines = [
+        "# Backtest walk-forward de props",
+        "",
+        "Generado por `PropsAgent.backtest` (`uv run nflp backtest props`). Para cada",
+        "temporada S se entrena con temporadas anteriores, se calibra la distribución",
+        "en S−1 y se evalúa S completa. Nunca hay split aleatorio.",
+        "",
+        "* **nuevo** — features v2, entrenamiento desde 2016, objetivo elegido por target,",
+        "  hiperparámetros afinados con Optuna, rejilla de cuantiles conformal (continuos)",
+        "  o Poisson (conteos).",
+        "* **actual** — el modelo v1 de producción (features v1, L1 en continuos y L2 en",
+        "  conteos, pseudo-labeling, log-normal global).",
+        "* **media_5_partidos** — media de los 5 partidos previos; Poisson(r5) en conteos y",
+        "  r5 + cuantiles de residuos de S−1 en continuos.",
+        "",
+        "Métricas: CRPS de la distribución servida (rejilla p05..p95 en continuos y en el",
+        "modelo actual; Poisson exacto en conteos para nuevo y media_5_partidos),",
+        "`coverage_80` = cobertura del intervalo p10–p90 (continuos) o PIT aleatorizado",
+        "dentro del 80 % central (conteos Poisson); `coverage_literal` = fracción de",
+        "observaciones dentro de [lower_80, upper_80]; `bias` = media(predicción − real).",
+        "",
+        "**Aviso de selección**: el objetivo puntual se eligió con el walk-forward 2020–2023",
+        "y los hiperparámetros con pliegues 2021–2023, así que en esas temporadas el",
+        "modelo nuevo está en muestra respecto a la selección. Las temporadas limpias son",
+        "2024 en adelante (2026 incompleta).",
+        "",
+        "## Global",
+        "",
+        fmt(overall[columns]),
+        "",
+        "## Por temporada",
+        "",
+    ]
+    for target in seasons["target"].unique():
+        lines += [f"### {target}", "", fmt(seasons[seasons["target"] == target][columns]
+                                            .sort_values(["season", "variant"])), ""]
+    md_path = directory / "props_backtest.md"
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    return md_path, csv_path
+
+
 def prop_feature_names(target: str) -> list[str]:
     return PROP_FEATURE_SETS[target]
+
+
+__all__ = [
+    "COVERAGE_BAND",
+    "PropBacktestResult",
+    "PropsAgent",
+    "evaluate_candidate",
+    "served_quantiles",
+    "write_backtest_report",
+]

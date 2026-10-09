@@ -240,7 +240,13 @@ class Predictor:
         persist: bool = True,
     ) -> PredictionBatch | None:
         """Predice un prop de jugador para los partidos indicados."""
-        from nflp.agents.modeling.props import filter_prop_rows
+        from nflp.agents.modeling.distributions import quantiles_to_json
+        from nflp.agents.modeling.props import (
+            filter_prop_rows,
+            served_interval,
+            served_quantiles,
+            served_std,
+        )
 
         selection = self._select_model(target, use_shadow=False)
         if selection is None:
@@ -293,11 +299,26 @@ class Predictor:
         distribution = artifact["distribution"]
         prediction = np.maximum(model.predict(X), 0.0)
 
-        lower, upper = distribution.interval(prediction)
+        # Distribución servida: rejilla conformal (continuos v2), Poisson
+        # (conteos v2) o la log-normal global de los artefactos v1. Las tres
+        # exponen la misma interfaz vía served_*; la rejilla p05..p95 se
+        # persiste siempre, λ solo cuando la distribución es Poisson.
+        kind = getattr(distribution, "kind", "lognormal")
+        grid = served_quantiles(distribution, prediction, frame)
+        lower, upper = served_interval(distribution, prediction, frame)
+
         result = frame[["game_id", "gsis_id", "season", "week", "team", "player_name", "as_of_ts"]].copy()
+        result["opponent_team"] = frame["opponent_team"] if "opponent_team" in frame else None
+        result["is_home"] = (
+            frame["is_home"].map(lambda v: None if pd.isna(v) else bool(v))
+            if "is_home" in frame else None
+        )
         result["point_estimate"] = prediction
-        result["pred_std"] = distribution.std(prediction)
+        result["pred_std"] = served_std(distribution, prediction, frame)
         result["lower_80"], result["upper_80"] = lower, upper
+        result["quantiles"] = quantiles_to_json(grid)
+        result["poisson_lambda"] = prediction if kind == "poisson" else np.nan
+        # Sin probabilidad: un prop no tiene línea propia contra la que medirla.
         result["probability"] = np.nan
         result["confidence_level"] = "media"
 
@@ -338,6 +359,7 @@ class Predictor:
             keep = [
                 "prediction_id", "game_id", "model_id", "target", "gsis_id",
                 "point_estimate", "probability", "pred_std", "lower_80", "upper_80",
+                "quantiles", "poisson_lambda", "team", "opponent_team", "is_home",
                 "confidence_level", "shap_values", "shap_base_value", "explanation_es",
                 "is_shadow", "as_of_ts", "predicted_at",
             ]

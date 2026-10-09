@@ -50,6 +50,10 @@ export interface PropPrediction {
   player_name: string;
   position: string | null;
   team: string;
+  opponent_team: string | null;
+  is_home: boolean | null;
+  quantiles?: string | null;
+  poisson_lambda?: number | null;
   receiving_yards: number | null;
   rushing_yards: number | null;
   receptions: number | null;

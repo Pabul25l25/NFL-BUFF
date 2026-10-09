@@ -3,11 +3,9 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { BottomNav } from "@/components/bottom-nav";
-import { GameGroup, PropGroups } from "@/components/prop-table";
+import { GameGroup, PropGroups, playerTeam } from "@/components/prop-table";
 import { GamePrediction, STAT_DEFS, PropPrediction, favoriteTeam } from "@/lib/types";
 import { upcomingWeek } from "@/lib/weeks";
-
-const PAGE = 40;
 
 const UNITS: Record<string, string> = {
   receiving_yards: "yds",
@@ -57,24 +55,23 @@ function lastPublished(sync: SyncRow[] | undefined): Date | null {
   return new Date(Math.max(...pool.map((r) => new Date(r.synced_at as string).getTime())));
 }
 
-/** Filtra, ordena y pagina las proyecciones; agrupa por partido en orden de kickoff. */
+/** Filtra y ordena las proyecciones; agrupa por partido en orden de kickoff. */
 function buildGroups(
   rows: PropPrediction[],
   favorites: Map<string, string | null>,
-  f: { pos: string; team: string; game: string },
-  shown: number
+  f: { pos: string; team: string; game: string }
 ): { groups: GameGroup[]; total: number } {
   const ts = (r: PropPrediction) => new Date(r.kickoff_utc).getTime();
   const filtered = rows
     .filter(
       (p) =>
         (!f.pos || p.position === f.pos) &&
-        (!f.team || p.team === f.team) &&
+        (!f.team || playerTeam(p) === f.team) &&
         (!f.game || p.game_id === f.game)
     )
     .sort((a, b) => ts(a) - ts(b) || a.game_id.localeCompare(b.game_id) || (b.point_estimate ?? 0) - (a.point_estimate ?? 0));
   const map = new Map<string, GameGroup>();
-  for (const p of filtered.slice(0, shown)) {
+  for (const p of filtered) {
     let g = map.get(p.game_id);
     if (!g) {
       g = {
@@ -103,7 +100,7 @@ export default function PropsPage() {
   const [pos, setPos] = useState("");
   const [team, setTeam] = useState("");
   const [game, setGame] = useState("");
-  const [shown, setShown] = useState(PAGE);
+  const [open, setOpen] = useState<Set<string>>(() => new Set());
   const [now] = useState(() => Date.now());
 
   const { data, isLoading, isError } = useQuery({
@@ -129,7 +126,7 @@ export default function PropsPage() {
     () => [...new Set(sel.rows.map((p) => p.position).filter((x): x is string => !!x))].sort(),
     [sel.rows]
   );
-  const teams = useMemo(() => [...new Set(sel.rows.map((p) => p.team))].sort(), [sel.rows]);
+  const teams = useMemo(() => [...new Set(sel.rows.map(playerTeam).filter((x): x is string => !!x))].sort(), [sel.rows]);
   const games = useMemo(() => {
     const m = new Map<string, string>();
     for (const p of sel.rows) m.set(p.game_id, `${p.away_team} @ ${p.home_team}`);
@@ -137,10 +134,17 @@ export default function PropsPage() {
   }, [sel.rows]);
 
   const { groups, total } = useMemo(
-    () => buildGroups(sel.rows, favorites, { pos, team, game }, shown),
-    [sel.rows, favorites, pos, team, game, shown]
+    () => buildGroups(sel.rows, favorites, { pos, team, game }),
+    [sel.rows, favorites, pos, team, game]
   );
-  const shownCount = groups.reduce((n, g) => n + g.rows.length, 0);
+  const allOpen = groups.length > 0 && groups.every((g) => open.has(g.game_id));
+  const toggleGame = (id: string) =>
+    setOpen((s) => {
+      const n = new Set(s);
+      if (!n.delete(id)) n.add(id);
+      return n;
+    });
+  const toggleAll = () => setOpen(allOpen ? new Set() : new Set(groups.map((g) => g.game_id)));
 
   const statDef = STAT_DEFS.find((s) => s.key === stat)!;
   const published = lastPublished(sync);
@@ -161,7 +165,7 @@ export default function PropsPage() {
             return (
               <button
                 key={s.key}
-                onClick={() => { setStat(s.key); setPos(""); setTeam(""); setGame(""); setShown(PAGE); }}
+                onClick={() => { setStat(s.key); setPos(""); setTeam(""); setGame(""); }}
                 aria-pressed={active}
                 className="rounded-full px-3 py-[6px] text-[12.5px] font-medium"
                 style={{
@@ -183,7 +187,11 @@ export default function PropsPage() {
               className="rounded-lg px-2 py-[6px]"
               style={selectStyle}
               value={game}
-              onChange={(e) => { setGame(e.target.value); setShown(PAGE); }}
+              onChange={(e) => {
+                const id = e.target.value;
+                setGame(id);
+                if (id) setOpen((s) => new Set(s).add(id));
+              }}
             >
               <option value="">Todos</option>
               {games.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
@@ -194,7 +202,7 @@ export default function PropsPage() {
               className="rounded-lg px-2 py-[6px]"
               style={selectStyle}
               value={pos}
-              onChange={(e) => { setPos(e.target.value); setShown(PAGE); }}
+              onChange={(e) => { setPos(e.target.value); }}
             >
               <option value="">Todas</option>
               {positions.map((x) => <option key={x} value={x}>{x}</option>)}
@@ -205,13 +213,13 @@ export default function PropsPage() {
               className="rounded-lg px-2 py-[6px]"
               style={selectStyle}
               value={team}
-              onChange={(e) => { setTeam(e.target.value); setShown(PAGE); }}
+              onChange={(e) => { setTeam(e.target.value); }}
             >
               <option value="">Todos</option>
               {teams.map((x) => <option key={x} value={x}>{x}</option>)}
             </select>
             <span className="ml-auto tabular-nums">
-              {shownCount} de {total} jugadores
+              {total} jugadores · {groups.length} partidos
             </span>
           </div>
         )}
@@ -253,19 +261,20 @@ export default function PropsPage() {
 
         {groups.length > 0 && (
           <>
-            <PropGroups groups={groups} unit={UNITS[stat] ?? ""} />
+            <div className="mb-2 flex justify-end">
+              <button
+                type="button"
+                onClick={toggleAll}
+                className="text-[12px] font-medium underline underline-offset-2"
+                style={{ color: "var(--text-2)" }}
+              >
+                {allOpen ? "Contraer todo" : "Expandir todo"}
+              </button>
+            </div>
+            <PropGroups groups={groups} unit={UNITS[stat] ?? ""} open={open} onToggle={toggleGame} />
             <p className="mt-2 text-[11px]" style={{ color: "var(--text-3)" }}>
               La barra muestra el rango del 80 % y la marca la proyección. Toca una fila con + para ver la explicación.
             </p>
-            {shownCount < total && (
-              <button
-                onClick={() => setShown((n) => n + PAGE)}
-                className="mx-auto mt-3 block rounded-[9px] px-[18px] py-[9px] text-[13px] font-medium"
-                style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--hair)" }}
-              >
-                Ver más jugadores
-              </button>
-            )}
           </>
         )}
       </div>

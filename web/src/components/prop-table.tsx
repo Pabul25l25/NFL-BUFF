@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { Fragment, useState } from "react";
 import { teamColor, teamInk } from "@/lib/teams";
 import { PropPrediction } from "@/lib/types";
@@ -33,7 +34,7 @@ function fmt(v: number | null | undefined, digits = 0): string {
 }
 
 /** Barra del rango 80% con marca en la proyeccion. max fija la escala. */
-function RangeBar({ p, max }: { p: PropPrediction; max: number }) {
+function RangeBar({ p, max, color }: { p: PropPrediction; max: number; color: string }) {
   if (p.point_estimate == null || p.lower_80 == null || p.upper_80 == null) {
     return <span style={{ color: "var(--text-3)" }}>—</span>;
   }
@@ -48,7 +49,7 @@ function RangeBar({ p, max }: { p: PropPrediction; max: number }) {
       >
         <i
           className="absolute bottom-0 top-0 rounded opacity-80"
-          style={{ left: `${lo}%`, width: `${Math.max(2, hi - lo)}%`, background: teamColor(p.team) }}
+          style={{ left: `${lo}%`, width: `${Math.max(2, hi - lo)}%`, background: color }}
         />
         <b
           className="absolute top-[-3px] h-[14px] w-[3px] rounded-sm"
@@ -74,94 +75,228 @@ export interface GameGroup {
   rows: PropPrediction[];
 }
 
-/** Proyecciones de UN stat agrupadas por partido; cada fila expande su explicacion. */
-export function PropGroups({ groups, unit }: { groups: GameGroup[]; unit: string }) {
+/** Equipo del jugador: p.team si existe; si no, por is_home. */
+export function playerTeam(p: PropPrediction): string | null {
+  if (p.team) return p.team;
+  if (p.is_home === true) return p.home_team;
+  if (p.is_home === false) return p.away_team;
+  return null;
+}
+
+/** Apellido(s) para el resumen del encabezado. */
+function shortName(n: string): string {
+  const parts = n.trim().split(/\s+/);
+  return parts.length > 1 ? parts.slice(1).join(" ") : n;
+}
+
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      className="shrink-0"
+      style={{ transform: open ? "rotate(180deg)" : undefined, color: "var(--text-3)" }}
+    >
+      <path d="M6 9l6 6 6-6" />
+    </svg>
+  );
+}
+
+function TeamBlock({
+  label,
+  team,
+  rows,
+  unit,
+  max,
+}: {
+  label: string;
+  team: string | null;
+  rows: PropPrediction[];
+  unit: string;
+  max: number;
+}) {
   const [open, setOpen] = useState<string | null>(null);
+  return (
+    <div className="min-w-0">
+      <div
+        className="flex items-baseline justify-between py-2 pl-3"
+        style={{ borderLeft: `3px solid ${teamColor(team)}`, borderBottom: "1px solid var(--hair)" }}
+      >
+        <span className="text-[14px] font-bold" style={{ color: team ? teamInk(team) : "var(--text-2)" }}>
+          {label}
+        </span>
+        <span className="text-[11.5px] tabular-nums" style={{ color: "var(--text-3)" }}>
+          {rows.length} {rows.length === 1 ? "jugador" : "jugadores"}
+        </span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[320px] border-collapse text-[13.5px] tabular-nums">
+          <thead>
+            <tr style={{ color: "var(--text-3)", borderBottom: "1px solid var(--hair)" }}>
+              <th className={TH}>Jugador</th>
+              <th className={`${TH} text-right`}>Proy.</th>
+              <th className={TH}>Rango 80 %</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((p) => {
+              const key = `${p.game_id}-${p.gsis_id}`;
+              const isOpen = open === key;
+              const can = !!p.explanation_es;
+              return (
+                <Fragment key={key}>
+                  <tr
+                    onClick={can ? () => setOpen(isOpen ? null : key) : undefined}
+                    style={{ borderBottom: "1px solid var(--hair-soft)", cursor: can ? "pointer" : "default" }}
+                    aria-expanded={can ? isOpen : undefined}
+                  >
+                    <td className={TD}>
+                      <span className="flex items-center gap-[8px]">
+                        <span className="font-semibold">{p.player_name}</span>
+                        <PosTag pos={p.position} />
+                        {can && (
+                          <span className="text-[11px]" style={{ color: "var(--text-3)" }}>
+                            {isOpen ? "−" : "+"}
+                          </span>
+                        )}
+                        {p.point_estimate != null && (
+                          <Link
+                            href={`/picks?game_id=${encodeURIComponent(p.game_id)}&add=${encodeURIComponent(
+                              `${p.gsis_id}:${p.target}:over:${Math.floor(p.point_estimate) + 0.5}`
+                            )}`}
+                            onClick={(e) => e.stopPropagation()}
+                            aria-label={`Agregar pick de ${p.player_name}`}
+                            className="ml-auto whitespace-nowrap text-[11px] font-semibold"
+                            style={{ color: "var(--accent)" }}
+                          >
+                            + Pick
+                          </Link>
+                        )}
+                      </span>
+                    </td>
+                    <td className={`${TD} text-right`}>
+                      <span className="text-[19px] font-bold">{fmt(p.point_estimate, 1)}</span>{" "}
+                      <span className="text-[11px]" style={{ color: "var(--text-3)" }}>{unit}</span>
+                    </td>
+                    <td className={TD}><RangeBar p={p} max={max} color={teamColor(team)} /></td>
+                  </tr>
+                  {isOpen && p.explanation_es && (
+                    <tr style={{ borderBottom: "1px solid var(--hair-soft)" }}>
+                      <td
+                        colSpan={3}
+                        className="px-3 pb-3 pt-1 text-[12.5px] leading-relaxed"
+                        style={{ color: "var(--text-2)" }}
+                      >
+                        {p.explanation_es}
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+const byEstimate = (a: PropPrediction, b: PropPrediction) => (b.point_estimate ?? -1) - (a.point_estimate ?? -1);
+
+/** Partidos colapsables; al abrir muestra ambos equipos lado a lado (md) o apilados. */
+export function PropGroups({
+  groups,
+  unit,
+  open,
+  onToggle,
+}: {
+  groups: GameGroup[];
+  unit: string;
+  open: Set<string>;
+  onToggle: (gameId: string) => void;
+}) {
   const max =
     Math.max(1, ...groups.flatMap((g) => g.rows.map((p) => p.upper_80 ?? p.point_estimate ?? 0))) * 1.1;
   return (
     <div>
       {groups.map((g) => {
         const tint = g.favorite ? teamColor(g.favorite) : "var(--hair)";
+        const isOpen = open.has(g.game_id);
+        const away: PropPrediction[] = [];
+        const home: PropPrediction[] = [];
+        const other: PropPrediction[] = [];
+        for (const p of g.rows) {
+          const t = playerTeam(p);
+          if (t === g.away_team) away.push(p);
+          else if (t === g.home_team) home.push(p);
+          else other.push(p);
+        }
+        away.sort(byEstimate);
+        home.sort(byEstimate);
+        other.sort(byEstimate);
+        const top = [away[0], home[0]].filter((p): p is PropPrediction => !!p && p.point_estimate != null);
+        const panel = `panel-${g.game_id}`;
         return (
-          <section key={g.game_id} className="mb-6">
-            <div
-              className="flex flex-wrap items-baseline justify-between gap-x-3 py-2 pl-3"
-              style={{ borderLeft: `3px solid ${tint}`, borderBottom: "1px solid var(--hair)" }}
+          <section key={g.game_id} className="mb-3">
+            <button
+              type="button"
+              aria-expanded={isOpen}
+              aria-controls={panel}
+              onClick={() => onToggle(g.game_id)}
+              className="flex w-full items-center gap-3 py-3 pl-3 text-left"
+              style={{ borderLeft: `3px solid ${tint}`, borderBottom: "1px solid var(--hair)", color: "var(--text)" }}
             >
-              <span className="text-[14px] font-bold">
-                {g.away_team} <span style={{ color: "var(--text-3)" }}>@</span> {g.home_team}
+              <span className="min-w-0 flex-1">
+                <span className="flex flex-wrap items-baseline justify-between gap-x-3">
+                  <span className="text-[14px] font-bold">
+                    {g.away_team} <span style={{ color: "var(--text-3)" }}>@</span> {g.home_team}
+                  </span>
+                  <span className="text-[11.5px] tabular-nums" style={{ color: "var(--text-2)" }}>
+                    {new Date(g.kickoff_utc).toLocaleString("es-MX", {
+                      weekday: "short",
+                      day: "numeric",
+                      month: "short",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                  </span>
+                </span>
+                <span
+                  className="mt-[2px] flex flex-wrap gap-x-3 text-[11.5px] tabular-nums"
+                  style={{ color: "var(--text-2)" }}
+                >
+                  {g.favorite && <span style={{ color: teamInk(g.favorite) }}>Favorito {g.favorite}</span>}
+                  <span>{g.rows.length} {g.rows.length === 1 ? "jugador" : "jugadores"}</span>
+                  {top.length > 0 && (
+                    <span>
+                      {top.map((p, i) => (
+                        <Fragment key={p.gsis_id}>
+                          {i > 0 && " · "}
+                          {shortName(p.player_name)} {fmt(p.point_estimate, 1)}
+                        </Fragment>
+                      ))}
+                    </span>
+                  )}
+                </span>
               </span>
-              <span className="text-[11.5px] tabular-nums" style={{ color: "var(--text-2)" }}>
-                {new Date(g.kickoff_utc).toLocaleString("es-MX", {
-                  weekday: "short",
-                  day: "numeric",
-                  month: "short",
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })}
-                {g.favorite && <span style={{ color: g.favorite ? teamInk(g.favorite) : undefined }}> · Favorito {g.favorite}</span>}
-              </span>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[520px] border-collapse text-[13.5px] tabular-nums">
-                <thead>
-                  <tr style={{ color: "var(--text-3)", borderBottom: "1px solid var(--hair)" }}>
-                    <th className={TH}>Jugador</th>
-                    <th className={TH}>Rival</th>
-                    <th className={`${TH} text-right`}>Proy.</th>
-                    <th className={TH}>Rango 80 %</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {g.rows.map((p) => {
-                    const key = `${p.game_id}-${p.gsis_id}`;
-                    const isOpen = open === key;
-                    const opp = p.team === p.home_team ? `vs ${p.away_team}` : `@ ${p.home_team}`;
-                    const can = !!p.explanation_es;
-                    return (
-                      <Fragment key={key}>
-                        <tr
-                          onClick={can ? () => setOpen(isOpen ? null : key) : undefined}
-                          style={{ borderBottom: "1px solid var(--hair-soft)", cursor: can ? "pointer" : "default" }}
-                          aria-expanded={can ? isOpen : undefined}
-                        >
-                          <td className={TD}>
-                            <span className="flex items-center gap-[10px]">
-                              <TeamDot team={p.team} />
-                              <span className="font-semibold">{p.player_name}</span>
-                              <PosTag pos={p.position} />
-                              {can && (
-                                <span className="text-[11px]" style={{ color: "var(--text-3)" }}>
-                                  {isOpen ? "−" : "+"}
-                                </span>
-                              )}
-                            </span>
-                          </td>
-                          <td className={TD} style={{ color: "var(--text-2)" }}>{opp}</td>
-                          <td className={`${TD} text-right`}>
-                            <span className="text-[21px] font-bold">{fmt(p.point_estimate, 1)}</span>{" "}
-                            <span className="text-[11px]" style={{ color: "var(--text-3)" }}>{unit}</span>
-                          </td>
-                          <td className={TD}><RangeBar p={p} max={max} /></td>
-                        </tr>
-                        {isOpen && p.explanation_es && (
-                          <tr style={{ borderBottom: "1px solid var(--hair-soft)" }}>
-                            <td
-                              colSpan={4}
-                              className="px-3 pb-3 pt-1 text-[12.5px] leading-relaxed"
-                              style={{ color: "var(--text-2)" }}
-                            >
-                              {p.explanation_es}
-                            </td>
-                          </tr>
-                        )}
-                      </Fragment>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+              <Chevron open={isOpen} />
+            </button>
+            {isOpen && (
+              <div id={panel} className="grid grid-cols-1 gap-x-6 gap-y-4 pt-3 md:grid-cols-2">
+                <TeamBlock label={g.away_team} team={g.away_team} rows={away} unit={unit} max={max} />
+                <TeamBlock label={g.home_team} team={g.home_team} rows={home} unit={unit} max={max} />
+                {other.length > 0 && (
+                  <TeamBlock label="Sin equipo" team={null} rows={other} unit={unit} max={max} />
+                )}
+              </div>
+            )}
           </section>
         );
       })}

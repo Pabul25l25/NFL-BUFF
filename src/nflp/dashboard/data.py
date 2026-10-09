@@ -103,12 +103,22 @@ def load_prop_predictions(
                p.explanation_es, p.shap_values,
                g.season, g.week, g.home_team, g.away_team, g.kickoff_utc,
                pl.display_name AS player_name, pl.position,
-               s.{actual_column} AS actual_value, s.team
+               s.{actual_column} AS actual_value,
+               COALESCE(s.team, f.team) AS team, f.opponent_team, f.is_home
         FROM predictions p
         JOIN games g USING (game_id)
         LEFT JOIN players pl ON pl.gsis_id = p.gsis_id
         LEFT JOIN player_stats_weekly s
           ON s.player_id = p.gsis_id AND s.season = g.season AND s.week = g.week
+         AND s.season_type = g.season_type
+        LEFT JOIN (
+            SELECT game_id, gsis_id, team, opponent_team, is_home
+            FROM features_player
+            QUALIFY row_number() OVER (
+                PARTITION BY game_id, gsis_id
+                ORDER BY feature_set_version DESC, as_of_ts DESC
+            ) = 1
+        ) f ON f.game_id = p.game_id AND f.gsis_id = p.gsis_id
         WHERE {' AND '.join(clauses)}
         -- misma razón que en load_predictions: solo la proyección más
         -- reciente por jugador y partido, no una por cada versión de modelo.

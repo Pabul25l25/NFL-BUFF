@@ -73,7 +73,7 @@ class WeatherConfig(BaseModel):
 
 
 class FeaturesConfig(BaseModel):
-    version: str = "v1"
+    version: str = "v2"
     rolling_windows: list[int] = Field(default_factory=lambda: [3, 5, 8])
     ewm_halflife: float = 4.0
     as_of_offset_hours: float = 1.0

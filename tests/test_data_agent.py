@@ -184,3 +184,53 @@ class TestMarketSeparation:
         assert "total_line" not in games_columns
         # El único punto de unión debe ser la clave.
         assert games_columns & market_columns == {"game_id"}
+
+
+class TestInjuryAvailabilityFallback:
+    def _games(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "season": [2025, 2025], "week": [1, 1],
+                "home_team": ["KC", "BUF"], "away_team": ["BAL", "MIA"],
+                "gameday": ["2025-09-04", "2025-09-07"],
+                "kickoff_utc": pd.to_datetime(["2025-09-05 00:20", "2025-09-07 17:00"]),
+            }
+        )
+
+    def _inj(self, teams: list[str], stamp=pd.NaT) -> pd.DataFrame:
+        return pd.DataFrame(
+            {"season": [2025] * len(teams), "week": [1] * len(teams), "team": teams,
+             "date_modified": pd.Series([stamp] * len(teams), dtype="datetime64[ns]")}
+        )
+
+    def test_missing_timestamp_visible_before_kickoff(self) -> None:
+        from nflp.agents.data.agent import derive_injury_availability
+
+        out = derive_injury_availability(self._inj(["KC", "BAL", "BUF"]), self._games())
+        assert out["date_modified"].notna().all()
+        # Jueves: miercoles 16:00 ET = 20:00 UTC; domingo: sabado 16:00 ET.
+        assert out.loc[0, "date_modified"] == pd.Timestamp("2025-09-03 20:00")
+        assert out.loc[2, "date_modified"] == pd.Timestamp("2025-09-06 20:00")
+
+    def test_never_visible_after_kickoff(self) -> None:
+        from nflp.agents.data.agent import derive_injury_availability
+
+        games = self._games()
+        games.loc[0, "kickoff_utc"] = pd.Timestamp("2025-09-03 12:00")  # kickoff anomalo
+        out = derive_injury_availability(self._inj(["KC"]), games)
+        assert out.loc[0, "date_modified"] < games.loc[0, "kickoff_utc"]
+        teams = ["KC", "BAL", "BUF", "MIA"]
+        full = derive_injury_availability(self._inj(teams), self._games())
+        g = self._games()
+        kick = {"KC": 0, "BAL": 0, "BUF": 1, "MIA": 1}
+        for i, team in enumerate(teams):
+            assert full.loc[i, "date_modified"] < g.loc[kick[team], "kickoff_utc"]
+
+    def test_existing_timestamp_kept_and_bye_stays_nat(self) -> None:
+        from nflp.agents.data.agent import derive_injury_availability
+
+        real = pd.Timestamp("2025-09-05 18:00")
+        kept = derive_injury_availability(self._inj(["KC"], real), self._games())
+        assert kept.loc[0, "date_modified"] == real
+        bye = derive_injury_availability(self._inj(["DEN"]), self._games())
+        assert pd.isna(bye.loc[0, "date_modified"])
