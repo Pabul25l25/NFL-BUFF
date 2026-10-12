@@ -385,6 +385,21 @@ class ModelRegistry:
 
     # ------------------------------------------------------------- bitácora
 
+    def log_event(
+        self,
+        *,
+        action: str,
+        target: str | None,
+        model_id: str | None,
+        previous_model_id: str | None = None,
+        reason: str = "",
+    ) -> None:
+        """Escribe una fila en ``retraining_log`` (API pública para otros agentes)."""
+        self._log_event(
+            action=action, target=target, model_id=model_id,
+            previous_model_id=previous_model_id, reason=reason,
+        )
+
     def _log_event(
         self,
         *,

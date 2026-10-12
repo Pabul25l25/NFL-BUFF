@@ -122,11 +122,17 @@ def evaluate_candidate(
     if not production:
         return True, "sin modelo de producción con el que comparar"
     mae_ok = candidate["val_mae"] < production["val_mae"]
-    crps_ok = candidate["val_crps"] < production["val_crps"]
+    prod_crps = production.get("val_crps")
+    if prod_crps is None or pd.isna(prod_crps):
+        # Producción anterior a props v2 sin CRPS: solo se puede comparar el MAE.
+        crps_ok = True
+        crps_text = f"CRPS {candidate['val_crps']:.4f} vs n/d"
+    else:
+        crps_ok = candidate["val_crps"] < prod_crps
+        crps_text = f"CRPS {candidate['val_crps']:.4f} vs {prod_crps:.4f}"
     detail = (
         f"MAE {candidate['val_mae']:.4f} vs {production['val_mae']:.4f}, "
-        f"CRPS {candidate['val_crps']:.4f} vs {production['val_crps']:.4f}, "
-        f"cobertura {coverage:.3f}"
+        f"{crps_text}, cobertura {coverage:.3f}"
     )
     if mae_ok and crps_ok:
         return True, "mejora MAE y CRPS: " + detail

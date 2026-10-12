@@ -21,6 +21,7 @@ El PSI se interpreta con los umbrales habituales de la industria:
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -29,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from nflp.agents.backtesting.metrics import classification_metrics, regression_metrics
+from nflp.agents.modeling.props_agent import evaluate_candidate
 from nflp.core.config import Settings, get_settings
 from nflp.core.db import Database, get_db
 from nflp.core.logging import get_logger
@@ -345,6 +347,9 @@ class MonitoringAgent:
             self.registry.promote(shadow_id, reason="no había modelo en producción")
             return {"action": "promote", "model_id": shadow_id, "reason": "primera promoción"}
 
+        if target in self.settings.props.targets:
+            return self._evaluate_prop_shadow(target, shadow_id, production_id)
+
         comparison = self.db.query(
             f"""
             SELECT model_id, avg(log_loss) AS log_loss, avg(mae) AS mae,
@@ -399,6 +404,50 @@ class MonitoringAgent:
             "action": "keep",
             "reason": f"el shadow no mejora ({shadow_score:.4f} >= {production_score:.4f})",
         }
+
+    def _prop_metrics(self, model_id: str) -> dict[str, float]:
+        raw = self.db.scalar(
+            f"SELECT metrics_json FROM model_registry WHERE model_id = '{model_id}'"
+        )
+        parsed = json.loads(raw) if raw else {}
+        return {k: float(v) for k, v in parsed.items() if isinstance(v, (int, float))}
+
+    def evaluate_prop_models(
+        self, candidate_id: str, production_id: str | None
+    ) -> tuple[bool, str]:
+        """Regla de promoción de props v2 (la misma de ``PropsAgent``): MAE y CRPS
+        mejoran y la cobertura al 80 % cae en banda."""
+        candidate = self._prop_metrics(candidate_id)
+        if "val_mae" not in candidate or "val_crps" not in candidate:
+            return False, "métricas de validación de props incompletas"
+        production = self._prop_metrics(production_id) if production_id else None
+        if production is not None and "val_mae" not in production:
+            production = None
+        return evaluate_candidate(candidate, production)
+
+    def _evaluate_prop_shadow(
+        self, target: str, shadow_id: str, production_id: str
+    ) -> dict[str, object]:
+        """Props: promoción con la regla v2. El gate de brecha train/val del
+        registro sigue aplicando (un modelo ``rejected`` nunca llega a shadow ni
+        puede promoverse)."""
+        allowed, reason = self.evaluate_prop_models(shadow_id, production_id)
+        if allowed:
+            if self.registry.promote(shadow_id, reason=f"props v2: {reason}"):
+                return {"action": "promote", "model_id": shadow_id, "reason": reason}
+            return {"action": "none", "reason": "el registro rechazó la promoción"}
+
+        full_reason = f"props v2: {reason}"
+        already = self.db.scalar(
+            f"SELECT count(*) FROM retraining_log WHERE model_id = '{shadow_id}' "
+            f"AND action = 'block' AND reason = '{full_reason.replace(chr(39), chr(39) * 2)}'"
+        )
+        if not already:
+            self.registry.log_event(
+                action="block", target=target, model_id=shadow_id,
+                previous_model_id=production_id, reason=full_reason,
+            )
+        return {"action": "keep", "reason": reason}
 
     # ------------------------------------------------------------- rollback
 

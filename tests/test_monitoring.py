@@ -177,3 +177,67 @@ class TestExplanations:
         row = pd.Series({f"feature_{i}": float(i) for i in range(20)})
         text = describe_contributions(contributions, row, top_n=3)
         assert text.count("(") <= 3
+
+
+def _register(registry, target, version, status, **metrics):
+    from nflp.registry import ModelRecord
+
+    record = ModelRecord(
+        model_id=f"{target}-{version}", target=target, family="lightgbm", version=version,
+        feature_set_version="v", feature_names=["a"], hyperparameters={}, dataset_hash="",
+        train_seasons="2020-2024", n_train_rows=10, n_val_rows=10, metric_name="mae",
+        train_metric=metrics["val_mae"], val_metric=metrics["val_mae"], metrics=metrics,
+        status=status,
+    )
+    registry.register(record, {"kind": "test"})
+    return record.model_id
+
+
+class TestShadowPromotionRules:
+    def _setup(self, settings, db, target, shadow_metrics):
+        agent = MonitoringAgent(settings, db)
+        prod = _register(
+            agent.registry, target, 1, "production",
+            val_mae=1.00, val_crps=0.80, val_coverage_80=0.80,
+        )
+        shadow = _register(agent.registry, target, 2, "shadow", **shadow_metrics)
+        return agent, prod, shadow
+
+    def test_prop_better_mae_but_coverage_out_of_range_is_rejected(self, settings, db) -> None:
+        agent, prod, shadow = self._setup(
+            settings, db, "sacks_suffered",
+            {"val_mae": 0.90, "val_crps": 0.70, "val_coverage_80": 0.72},
+        )
+        result = agent.evaluate_shadow("sacks_suffered")
+        assert result["action"] == "keep"
+        assert agent.registry.current_production("sacks_suffered") == prod
+        log = db.query("SELECT action, reason FROM retraining_log WHERE action = 'block'")
+        assert len(log) == 1 and "cobertura" in log.iloc[0]["reason"]
+        # idempotente: una segunda corrida no duplica el bloqueo
+        agent.evaluate_shadow("sacks_suffered")
+        assert len(db.query("SELECT * FROM retraining_log WHERE action = 'block'")) == 1
+
+    def test_prop_better_mae_worse_crps_is_rejected(self, settings, db) -> None:
+        agent, prod, _ = self._setup(
+            settings, db, "receptions",
+            {"val_mae": 0.90, "val_crps": 0.85, "val_coverage_80": 0.80},
+        )
+        assert agent.evaluate_shadow("receptions")["action"] == "keep"
+        assert agent.registry.current_production("receptions") == prod
+
+    def test_prop_improving_everything_is_promoted(self, settings, db) -> None:
+        agent, _, shadow = self._setup(
+            settings, db, "passing_tds",
+            {"val_mae": 0.90, "val_crps": 0.70, "val_coverage_80": 0.80},
+        )
+        assert agent.evaluate_shadow("passing_tds")["action"] == "promote"
+        assert agent.registry.current_production("passing_tds") == shadow
+
+    def test_game_target_keeps_mae_rule(self, settings, db) -> None:
+        # Cobertura fuera de banda es irrelevante para targets de partido.
+        agent, _, shadow = self._setup(
+            settings, db, "spread",
+            {"val_mae": 0.90, "val_crps": 0.90, "val_coverage_80": 0.10},
+        )
+        assert agent.evaluate_shadow("spread")["action"] == "promote"
+        assert agent.registry.current_production("spread") == shadow
