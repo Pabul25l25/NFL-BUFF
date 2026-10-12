@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { BottomNav } from "@/components/bottom-nav";
-import { GameGroup, PropGroups, playerTeam } from "@/components/prop-table";
+import { GameGroup, PropGroups, meanOf, playerTeam } from "@/components/prop-table";
 import { GamePrediction, STAT_DEFS, PropPrediction, favoriteTeam } from "@/lib/types";
 import { upcomingWeek } from "@/lib/weeks";
 
@@ -69,7 +69,7 @@ function buildGroups(
         (!f.team || playerTeam(p) === f.team) &&
         (!f.game || p.game_id === f.game)
     )
-    .sort((a, b) => ts(a) - ts(b) || a.game_id.localeCompare(b.game_id) || (b.point_estimate ?? 0) - (a.point_estimate ?? 0));
+    .sort((a, b) => ts(a) - ts(b) || a.game_id.localeCompare(b.game_id) || (meanOf(b) ?? 0) - (meanOf(a) ?? 0));
   const map = new Map<string, GameGroup>();
   for (const p of filtered) {
     let g = map.get(p.game_id);

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { Leg, ParlayInputs, Side, TeamSide, evaluateParlay, halfLine, legKey } from "@/lib/parlay";
-import { defaultPlayerLine, fmtLine, gameLabel, marketLabel, marketsFor, pct } from "./labels";
+import { defaultPlayerLine, fmtLine, gameLabel, marketLabel, marketsFor, pct, playerProjection } from "./labels";
 import { Field, btn, fieldStyle, label } from "./ui";
 
 export function Builder({ inputs, inTicket, onAdd }: { inputs: ParlayInputs; inTicket: Set<string>; onAdd: (l: Leg) => void }) {
@@ -39,6 +39,7 @@ export function Builder({ inputs, inTicket, onAdd }: { inputs: ParlayInputs; inT
 
   const lineKey = `${playerId}|${market}`;
   const defLine = playerId && market && !isTd ? defaultPlayerLine(inputs, playerId, market) : 0;
+  const proj = playerId && market && !isTd ? playerProjection(inputs, playerId, market) : null;
   const lineText = edit?.key === lineKey ? edit.value : String(defLine);
   const lineNum = Number(lineText);
   const lineOk = lineText.trim() !== "" && Number.isFinite(lineNum);
@@ -149,6 +150,16 @@ export function Builder({ inputs, inTicket, onAdd }: { inputs: ParlayInputs; inT
                   />
                 </Field>
               </>
+            )}
+            {proj && proj.mean != null && (
+              <p className="text-[12.5px] tabular-nums sm:col-span-2" style={{ color: "var(--text-2)" }}>
+                Media <span className="font-bold" style={{ color: "var(--text)" }}>{proj.mean.toFixed(1)}</span>
+                {proj.median != null && (
+                  <span className="text-[11px]" style={{ color: "var(--text-3)" }}>
+                    {" "}· Línea 50/50 {proj.median.toFixed(1)}
+                  </span>
+                )}
+              </p>
             )}
           </div>
         )

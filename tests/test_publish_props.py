@@ -36,6 +36,11 @@ def _pred(pid: str, model: str, target: str, **extra: object) -> dict:
 
 
 def _seed(db: Database) -> None:
+    # Columnas de la migración 011; IF NOT EXISTS para no depender de su orden.
+    db.execute_script(
+        "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS mean_estimate DOUBLE;"
+        "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS nb_dispersion DOUBLE;"
+    )
     kickoff = datetime.now() + timedelta(days=3)
     db.write_df(
         pd.DataFrame([{
@@ -90,6 +95,19 @@ def test_props_only_production_model_and_distribution_columns(db: Database) -> N
     assert pd.isna(cont["poisson_lambda"])  # continuo: sin lambda
     td = frame[frame["target"] == "receiving_tds"].iloc[0]
     assert td["poisson_lambda"] == 0.4  # COALESCE(poisson_lambda, point_estimate)
+
+
+def test_props_mean_estimate_and_dispersion(db: Database) -> None:
+    _seed(db)
+    db.execute("UPDATE predictions SET mean_estimate = 61.5 WHERE prediction_id = 'p1'")
+    db.execute("UPDATE predictions SET nb_dispersion = 3.2 WHERE prediction_id = 'p_td'")
+    frame = db.query(_QUERY_PREDICTIONS_PROPS)
+    cont = frame[frame["target"] == "receiving_yards"].iloc[0]
+    assert cont["mean_estimate"] == 61.5
+    assert pd.isna(cont["nb_dispersion"])
+    td = frame[frame["target"] == "receiving_tds"].iloc[0]
+    assert td["mean_estimate"] == 0.4  # fallback a point_estimate
+    assert td["nb_dispersion"] == 3.2
 
 
 def test_props_predictions_team_wins_over_features_fallback(db: Database) -> None:

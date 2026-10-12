@@ -5,7 +5,7 @@ walk-forward, calibración fuera de muestra y gate de promoción.
 
 La evaluación usa **CRPS** además de MAE, y el CRPS puntúa la distribución que
 realmente se sirve: rejilla de cuantiles p05..p95 para los continuos, Poisson
-exacta para los conteos (ver ``distributions.py``). Un modelo que acierta la
+o binomial negativa exactas para los conteos (ver ``distributions.py``). Un modelo que acierta la
 media pero se equivoca en la dispersión produce probabilidades over/under malas
 aunque su MAE sea bueno. Además se mide la **cobertura del 80 %** (literal en
 continuos, PIT aleatorizado en conteos) y el **sesgo** medio.
@@ -24,6 +24,7 @@ import pandas as pd
 from nflp.agents.backtesting.metrics import regression_metrics
 from nflp.agents.modeling.distributions import (
     P10_INDEX,
+    P50_INDEX,
     P90_INDEX,
     QUANTILE_LEVELS,
     PoissonDistribution,
@@ -42,7 +43,10 @@ from nflp.agents.modeling.props import (
     served_coverage,
     served_crps,
     served_crps_rows,
+    served_dispersion,
     served_interval,
+    served_mean,
+    served_point,
     served_quantiles,
     train_prop_model,
 )
@@ -109,6 +113,32 @@ def aggregate_scores(rows: pd.DataFrame, by: list[str]) -> pd.DataFrame:
         mean_true=("y_true", "mean"),
     )
     return out.reset_index()
+
+
+def distribution_diagnostics(
+    distribution: Any, y: np.ndarray, point: np.ndarray, X: pd.DataFrame, target: str
+) -> dict[str, float]:
+    """Sesgo de la media servida y calibración de la mediana (informativos).
+
+    * ``val_mean_bias`` = media(``mean_estimate`` − real): debe ser ≈ 0.
+    * ``val_frac_below_p50`` / ``val_frac_below_point``: fracción de reales por
+      debajo de la mediana de la rejilla y de la estimación puntual (≈ 0,5).
+    * ``val_nb_size_mean``: tamaño r medio si la distribución es binomial negativa.
+    """
+    y = np.asarray(y, dtype=float)
+    point = np.asarray(point, dtype=float)
+    out = {
+        "val_mean_bias": float(np.mean(served_mean(distribution, point, X, target=target) - y)),
+        "val_frac_below_point": float(np.mean(y < point)),
+    }
+    if target not in SPARSE_COUNT_PROPS:
+        out["val_frac_below_p50"] = float(
+            np.mean(y < served_quantiles(distribution, point, X)[:, P50_INDEX])
+        )
+    size = served_dispersion(distribution, point)
+    if np.isfinite(size).any():
+        out["val_nb_size_mean"] = float(np.nanmean(size))
+    return out
 
 
 def evaluate_candidate(
@@ -243,7 +273,10 @@ class PropsAgent:
             point = new.predict(test)
             lower, upper = new.interval(test, point)
             crps = served_crps_rows(new.distribution, y, point, test)
-            covered = randomized_pit_covered(y, point) if is_count else None
+            covered = (
+                randomized_pit_covered(y, point, size=served_dispersion(new.distribution, point))
+                if is_count else None
+            )
             blocks.append(meta.join(score_rows(y, point, crps, lower, upper, covered)).assign(variant="nuevo"))
 
             # --- actual (v1) ---
@@ -304,9 +337,8 @@ class PropsAgent:
     def evaluate_artifact(self, artifact: dict[str, Any], validation: pd.DataFrame) -> dict[str, float]:
         """Métricas de un artefacto registrado sobre filas de validación dadas."""
         target = artifact["target"]
-        X = validation.reindex(columns=artifact["feature_names"]).astype(float)
-        point = np.maximum(artifact["model"].predict(X), 0.0)
         distribution = artifact["distribution"]
+        point = served_point(artifact["model"], distribution, validation, artifact["feature_names"])
         y = validation[target].astype(float).to_numpy()
         metrics = regression_metrics(y, point)
         lower, upper = served_interval(distribution, point, validation)
@@ -319,6 +351,7 @@ class PropsAgent:
             ),
             "val_coverage_80": served_coverage(distribution, y, point, validation),
             "val_coverage_literal": interval_coverage(y, lower, upper),
+            **distribution_diagnostics(distribution, y, point, validation, target),
             "n_val": float(len(validation)),
         }
 
@@ -358,7 +391,12 @@ class PropsAgent:
             "val_coverage_80": served_coverage(model.distribution, y_val, val_pred, validation),
             "val_coverage_literal": interval_coverage(y_val, lower, upper),
             "calib_coverage_80": float(getattr(model.distribution, "calibration_coverage", np.nan)),
+            **distribution_diagnostics(model.distribution, y_val, val_pred, validation, target),
         }
+        for key, value in getattr(model.distribution, "calibration", {}).items():
+            model.metrics[f"calib_{key}"] = float(value)
+        for key, value in getattr(model.distribution, "point_calibration", {}).items():
+            model.metrics[f"calib_point_{key}"] = float(value)
 
         # La producción vigente, puntuada sobre exactamente las mismas filas y
         # con el mismo CRPS: la comparación de promoción es manzanas con manzanas.
@@ -368,9 +406,11 @@ class PropsAgent:
             model.metrics.update({f"prod_{k}": v for k, v in prod_metrics.items()})
 
         log.info(
-            "Prop '%s' (%s): MAE train=%.3f val=%.3f · CRPS=%.3f · cobertura80=%.3f · sesgo=%+.3f",
-            target, model.objective, train_metrics.mae, val_metrics.mae,
+            "Prop '%s' (%s, %s): MAE train=%.3f val=%.3f · CRPS=%.3f · cobertura80=%.3f · "
+            "sesgo=%+.3f · sesgo media=%+.3f",
+            target, model.objective, model.distribution_kind, train_metrics.mae, val_metrics.mae,
             model.metrics["val_crps"], model.metrics["val_coverage_80"], model.metrics["val_bias"],
+            model.metrics["val_mean_bias"],
         )
 
         if register:
@@ -390,6 +430,13 @@ class PropsAgent:
                     "pseudo_labels": model.used_pseudo_labels,
                     "objective": model.objective,
                     "distribution": model.distribution_kind,
+                    **(
+                        {
+                            "nb_log_size_intercept": model.distribution.log_size_intercept,
+                            "nb_log_size_slope": model.distribution.log_size_slope,
+                        }
+                        if model.distribution_kind == "negbin" else {}
+                    ),
                     "min_train_season": min_season,
                     **{k: v for k, v in model.params.items() if k not in {"verbose", "n_jobs"}},
                 },
@@ -517,6 +564,7 @@ __all__ = [
     "COVERAGE_BAND",
     "PropBacktestResult",
     "PropsAgent",
+    "distribution_diagnostics",
     "evaluate_candidate",
     "served_quantiles",
     "write_backtest_report",

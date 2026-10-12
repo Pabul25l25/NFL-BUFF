@@ -61,3 +61,16 @@ export function defaultPlayerLine(inputs: ParlayInputs, gsis: string, target: st
 
 export const pct = (p: number, d = 1) => `${(p * 100).toFixed(d)} %`;
 export const gameLabel = (g: { away_team: string; home_team: string }) => `${g.away_team} @ ${g.home_team}`;
+
+/** Proyeccion del jugador: media (valor esperado) y linea 50/50 (mediana). */
+export function playerProjection(
+  inputs: ParlayInputs,
+  gsis: string,
+  target: string
+): { mean: number | null; median: number | null } {
+  const m = inputs.markets.find((x) => x.gsis_id === gsis && x.target === target);
+  if (!m) return { mean: null, median: null };
+  const median = m.point_estimate ?? (m.quantiles ? m.quantiles[9] : null);
+  const mean = m.mean_estimate ?? m.lambda ?? median;
+  return { mean, median };
+}

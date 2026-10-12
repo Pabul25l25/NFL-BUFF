@@ -319,8 +319,16 @@ def test_predictions_persist_quantiles_lambda_and_team(settings, db, target: str
         assert row["lower_80"] == pytest.approx(grid[1], abs=0.01)
         assert row["upper_80"] == pytest.approx(grid[-2], abs=0.01)
 
+    assert stored["nb_dispersion"].isna().all()  # Poisson y rejilla: sin r
+    assert stored["mean_estimate"].notna().all()
     if target in SPARSE_COUNT_PROPS:
         assert stored["poisson_lambda"].notna().all()
         np.testing.assert_allclose(stored["poisson_lambda"], stored["point_estimate"])
+        np.testing.assert_allclose(stored["mean_estimate"], stored["point_estimate"])
     else:
         assert stored["poisson_lambda"].isna().all()
+        from nflp.agents.modeling.distributions import grid_mean
+
+        grids = np.array([json.loads(q) for q in stored["quantiles"]])
+        # La media se calcula con la rejilla sin redondear; tolerancia del redondeo a 2 decimales.
+        np.testing.assert_allclose(stored["mean_estimate"], grid_mean(grids, 0.0), atol=0.02)

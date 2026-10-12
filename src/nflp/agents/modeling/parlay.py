@@ -7,7 +7,8 @@ estima esa dependencia y la sirve como una matriz de correlación por partido.
 
 **Modelo.** Cada pierna (prop de jugador o pierna de partido) conserva su
 distribución marginal servida — rejilla de cuantiles p05..p95 (continuos),
-Poisson(λ) (conteos) o normal (margen y total del partido) — y la
+Poisson(λ) o binomial negativa(μ, r) (conteos) o normal (margen y total del
+partido) — y la
 dependencia se modela con una **cópula gaussiana**: la puntuación normal
 ``z = Φ⁻¹(PIT)`` de las piernas de un mismo partido es normal multivariante
 con matriz ``R``.
@@ -17,7 +18,7 @@ predicciones walk-forward (entrenamiento ≤ S−2, calibración S−1, prueba S
 la misma maquinaria que ``PropsAgent.backtest``) y la distribución que se
 sirve. Los resultados son enteros, así que el PIT es **aleatorizado**:
 ``u ~ U(F(y⁻), F(y))``, con ``F(y⁻) = F(y − 0,5)`` en rejillas y normales (las
-líneas son x,5) y ``F(y − 1)`` en Poisson. Así el evento "más de la línea"
+líneas son x,5) y ``F(y − 1)`` en Poisson y binomial negativa. Así el evento "más de la línea"
 es exactamente ``u > F(línea)`` y la cópula de las ``u`` es una cópula válida
 del vector discreto (transformación distribucional).
 
@@ -54,9 +55,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm, poisson
+from scipy.stats import norm
 
-from nflp.agents.modeling.distributions import QUANTILE_LEVELS
+from nflp.agents.modeling.distributions import QUANTILE_LEVELS, count_cdf, grid_tail_slopes
 from nflp.agents.modeling.props import (
     PROP_MIN_TRAIN_SEASON,
     QUANTILE_LOWER_BOUND,
@@ -217,18 +218,15 @@ def grid_cdf(x: np.ndarray, grid: np.ndarray, lower_bound: float | None = 0.0) -
         q0, q1 = grid[rows, jj], grid[rows, jj + 1]
         out[rows] = _LEVELS[jj] + (x[rows] - q0) / (q1 - q0) * (_LEVELS[jj + 1] - _LEVELS[jj])
 
-    # Escala (unidades del objetivo por unidad z) de cada cola.
-    overall = np.maximum((grid[:, -1] - grid[:, 0]) / (_ZLEVELS[-1] - _ZLEVELS[0]), 1e-6)
+    # Escala (unidades del objetivo por unidad z) de cada cola: la misma que
+    # usa la media implícita de la rejilla (``distributions.grid_mean``).
+    slope_low, slope_high = grid_tail_slopes(grid)
     upper = j == m - 1
     if upper.any():
-        slope = (grid[:, -1] - grid[:, -2]) / (_ZLEVELS[-1] - _ZLEVELS[-2])
-        slope = np.where(slope > 1e-9, slope, overall)
-        out[upper] = norm.cdf(_ZLEVELS[-1] + (x[upper] - grid[upper, -1]) / slope[upper])
+        out[upper] = norm.cdf(_ZLEVELS[-1] + (x[upper] - grid[upper, -1]) / slope_high[upper])
     lower = j < 0
     if lower.any():
-        slope = (grid[:, 1] - grid[:, 0]) / (_ZLEVELS[1] - _ZLEVELS[0])
-        slope = np.where(slope > 1e-9, slope, overall)
-        out[lower] = norm.cdf(_ZLEVELS[0] - (grid[lower, 0] - x[lower]) / slope[lower])
+        out[lower] = norm.cdf(_ZLEVELS[0] - (grid[lower, 0] - x[lower]) / slope_low[lower])
     if lower_bound is not None:
         out[x < lower_bound] = 0.0
     return np.clip(out, 0.0, 1.0)
@@ -241,13 +239,15 @@ def marginal_cdf(
     grid: np.ndarray | None = None,
     lower_bound: np.ndarray | None = None,
     lam: np.ndarray | None = None,
+    size: np.ndarray | None = None,
     mu: np.ndarray | None = None,
     sigma: np.ndarray | None = None,
 ) -> np.ndarray:
-    """``F(x)`` de cada pierna según su familia (grid, poisson o normal).
+    """``F(x)`` de cada pierna según su familia (grid, poisson, negbin o normal).
 
-    En Poisson se evalúa en ``floor(x)`` (la masa es entera). ``lower_bound``
-    por fila; NaN = sin suelo.
+    En Poisson y binomial negativa se evalúa en ``floor(x)`` (la masa es
+    entera); la NB usa media ``lam`` y tamaño ``size`` (``Var = λ + λ²/r``).
+    ``lower_bound`` por fila; NaN = sin suelo.
     """
     kind = np.asarray(kind)
     x = np.asarray(x, dtype=float)
@@ -261,7 +261,10 @@ def marginal_cdf(
             out[sel] = grid_cdf(x[sel], grid[sel], None if np.isinf(bound) else float(bound))
     is_pois = kind == "poisson"
     if is_pois.any():
-        out[is_pois] = poisson.cdf(np.floor(x[is_pois]), np.maximum(lam[is_pois], 1e-9))
+        out[is_pois] = count_cdf(np.floor(x[is_pois]), lam[is_pois])
+    is_nb = kind == "negbin"
+    if is_nb.any():
+        out[is_nb] = count_cdf(np.floor(x[is_nb]), lam[is_nb], size[is_nb])
     is_norm = kind == "normal"
     if is_norm.any():
         out[is_norm] = norm.cdf(x[is_norm], loc=mu[is_norm], scale=np.maximum(sigma[is_norm], 1e-9))
@@ -277,12 +280,12 @@ def randomized_pit(
     """PIT aleatorizado de resultados enteros: ``u ~ U(F(y⁻), F(y))``.
 
     * grid y normal: ``F(y⁻) = F(y − 0,5)``, ``F(y) = F(y + 0,5)`` (continuidad);
-    * poisson: ``F(y − 1)`` y ``F(y)``.
+    * poisson y negbin: ``F(y − 1)`` y ``F(y)``.
     Con el modelo correcto ``u`` es U(0,1) exacta.
     """
     kind = np.asarray(kind)
     y = np.asarray(y, dtype=float)
-    is_pois = kind == "poisson"
+    is_pois = np.isin(kind, ["poisson", "negbin"])
     lo_x = np.where(is_pois, y - 1.0, y - 0.5)
     hi_x = np.where(is_pois, y, y + 0.5)
     lo = marginal_cdf(kind, lo_x, **params)
@@ -307,7 +310,9 @@ def half_line(value: np.ndarray) -> np.ndarray:
 
 
 def served_variant(registry: Any, target: str) -> str:
-    """``legacy`` si producción sirve el modelo v1 (log-normal), si no ``v2``."""
+    """``legacy`` si producción sirve el modelo v1 (log-normal); ``v2-negbin`` si
+    sirve una binomial negativa; si no ``v2``. Cambiar de variante invalida la
+    caché de puntuaciones fuera de muestra."""
     try:
         production = registry.load_production(target)
     except Exception as exc:  # noqa: BLE001 - sin producción → v2
@@ -316,16 +321,22 @@ def served_variant(registry: Any, target: str) -> str:
     if production is None:
         return "v2"
     kind = getattr(production[1].get("distribution"), "kind", "lognormal")
-    return "legacy" if kind == "lognormal" else "v2"
+    if kind == "lognormal":
+        return "legacy"
+    return "v2-negbin" if kind == "negbin" else "v2"
 
 
 def prop_marginals(target: str, model: Any, frame: pd.DataFrame) -> dict[str, Any]:
-    """Marginal servida de un prop: λ (conteos) o rejilla (continuos).
+    """Marginal servida de un prop: λ (conteos), λ y r (NB) o rejilla (continuos).
 
     Los conteos se sirven como Poisson(λ = estimación puntual) aunque el
-    artefacto sea el log-normal heredado (es el λ de reserva que usa la web).
+    artefacto sea el log-normal heredado (es el λ de reserva que usa la web);
+    si la distribución es binomial negativa, con su tamaño r.
     """
     point = model.predict(frame)
+    if target in SPARSE_COUNT_PROPS and getattr(model.distribution, "kind", "") == "negbin":
+        lam = np.maximum(point, 1e-6)
+        return {"kind": "negbin", "lam": lam, "size": model.distribution.size(lam), "point": point}
     if target in SPARSE_COUNT_PROPS:
         return {"kind": "poisson", "lam": np.maximum(point, 1e-6), "point": point}
     return {"kind": "grid", "grid": model.quantiles(frame, point), "point": point}
@@ -371,6 +382,7 @@ def collect_prop_oos(
         out["kind"] = marg["kind"]
         out["point"] = marg["point"]
         out["lam"] = marg.get("lam", np.full(len(out), np.nan))
+        out["size"] = marg.get("size", np.full(len(out), np.nan))
         grid = marg.get("grid")
         grid = np.full((len(out), len(_QCOLS)), np.nan) if grid is None else np.asarray(grid)
         out[_QCOLS] = grid
@@ -491,7 +503,7 @@ def _marginal_params(legs: pd.DataFrame) -> dict[str, Any]:
     grid = legs[_QCOLS].to_numpy(dtype=float) if set(_QCOLS) <= set(legs.columns) else np.full((n, len(_QCOLS)), np.nan)
     return {
         "grid": grid, "lower_bound": col("lower_bound"),
-        "lam": col("lam"), "mu": col("mu"), "sigma": col("sigma"),
+        "lam": col("lam"), "size": col("size"), "mu": col("mu"), "sigma": col("sigma"),
     }
 
 

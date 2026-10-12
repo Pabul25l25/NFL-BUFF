@@ -51,7 +51,7 @@ export async function GET(req: NextRequest) {
     SELECT game_id, gsis_id, target, point_estimate, lower_80, upper_80,
            explanation_es, shap_values, predicted_at, as_of_ts, season, week,
            home_team, away_team, kickoff_utc, player_name, position, team,
-           opponent_team, is_home, quantiles, poisson_lambda,
+           opponent_team, is_home, quantiles, poisson_lambda, mean_estimate,
            receiving_yards, rushing_yards, receptions, receiving_tds,
            rushing_tds, passing_yards, passing_tds, sacks_suffered
     FROM pub_predictions_props

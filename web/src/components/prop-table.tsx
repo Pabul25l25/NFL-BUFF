@@ -33,9 +33,13 @@ function fmt(v: number | null | undefined, digits = 0): string {
   return v == null ? "—" : v.toFixed(digits);
 }
 
+/** Media esperada (con respaldo en la mediana si no hay media). */
+export const meanOf = (p: PropPrediction): number | null => p.mean_estimate ?? p.point_estimate;
+
 /** Barra del rango 80% con marca en la proyeccion. max fija la escala. */
 function RangeBar({ p, max, color }: { p: PropPrediction; max: number; color: string }) {
-  if (p.point_estimate == null || p.lower_80 == null || p.upper_80 == null) {
+  const mean = meanOf(p);
+  if (mean == null || p.lower_80 == null || p.upper_80 == null) {
     return <span style={{ color: "var(--text-3)" }}>—</span>;
   }
   const sc = (n: number) => Math.max(0, Math.min(100, (n / max) * 100));
@@ -53,7 +57,7 @@ function RangeBar({ p, max, color }: { p: PropPrediction; max: number; color: st
         />
         <b
           className="absolute top-[-3px] h-[14px] w-[3px] rounded-sm"
-          style={{ left: `calc(${sc(p.point_estimate)}% - 1px)`, background: "var(--text)" }}
+          style={{ left: `calc(${sc(mean)}% - 1px)`, background: "var(--text)" }}
         />
       </div>
       <span className="text-[11px] tabular-nums" style={{ color: "var(--text-3)" }}>
@@ -141,7 +145,7 @@ function TeamBlock({
           <thead>
             <tr style={{ color: "var(--text-3)", borderBottom: "1px solid var(--hair)" }}>
               <th className={TH}>Jugador</th>
-              <th className={`${TH} text-right`}>Proy.</th>
+              <th className={`${TH} text-right`}>Media</th>
               <th className={TH}>Rango 80 %</th>
             </tr>
           </thead>
@@ -149,7 +153,7 @@ function TeamBlock({
             {rows.map((p) => {
               const key = `${p.game_id}-${p.gsis_id}`;
               const isOpen = open === key;
-              const can = !!p.explanation_es;
+              const can = p.point_estimate != null || !!p.explanation_es;
               return (
                 <Fragment key={key}>
                   <tr
@@ -182,19 +186,27 @@ function TeamBlock({
                       </span>
                     </td>
                     <td className={`${TD} text-right`}>
-                      <span className="text-[19px] font-bold">{fmt(p.point_estimate, 1)}</span>{" "}
+                      <span className="text-[19px] font-bold">{fmt(meanOf(p), 1)}</span>{" "}
                       <span className="text-[11px]" style={{ color: "var(--text-3)" }}>{unit}</span>
+                      {p.point_estimate != null && (
+                        <div className="text-[11px]" style={{ color: "var(--text-3)" }}>
+                          Línea 50/50 {fmt(p.point_estimate, 1)}
+                        </div>
+                      )}
                     </td>
                     <td className={TD}><RangeBar p={p} max={max} color={teamColor(team)} /></td>
                   </tr>
-                  {isOpen && p.explanation_es && (
+                  {isOpen && (
                     <tr style={{ borderBottom: "1px solid var(--hair-soft)" }}>
                       <td
                         colSpan={3}
                         className="px-3 pb-3 pt-1 text-[12.5px] leading-relaxed"
                         style={{ color: "var(--text-2)" }}
                       >
-                        {p.explanation_es}
+                        <p style={{ color: "var(--text-3)" }}>
+                          Media: valor esperado; Línea 50/50: el jugador supera esta cifra la mitad de las veces.
+                        </p>
+                        {p.explanation_es && <p className="mt-1">{p.explanation_es}</p>}
                       </td>
                     </tr>
                   )}
@@ -208,7 +220,7 @@ function TeamBlock({
   );
 }
 
-const byEstimate = (a: PropPrediction, b: PropPrediction) => (b.point_estimate ?? -1) - (a.point_estimate ?? -1);
+const byEstimate = (a: PropPrediction, b: PropPrediction) => (meanOf(b) ?? -1) - (meanOf(a) ?? -1);
 
 /** Partidos colapsables; al abrir muestra ambos equipos lado a lado (md) o apilados. */
 export function PropGroups({
@@ -223,7 +235,7 @@ export function PropGroups({
   onToggle: (gameId: string) => void;
 }) {
   const max =
-    Math.max(1, ...groups.flatMap((g) => g.rows.map((p) => p.upper_80 ?? p.point_estimate ?? 0))) * 1.1;
+    Math.max(1, ...groups.flatMap((g) => g.rows.map((p) => p.upper_80 ?? meanOf(p) ?? 0))) * 1.1;
   return (
     <div>
       {groups.map((g) => {
@@ -241,7 +253,7 @@ export function PropGroups({
         away.sort(byEstimate);
         home.sort(byEstimate);
         other.sort(byEstimate);
-        const top = [away[0], home[0]].filter((p): p is PropPrediction => !!p && p.point_estimate != null);
+        const top = [away[0], home[0]].filter((p): p is PropPrediction => !!p && meanOf(p) != null);
         const panel = `panel-${g.game_id}`;
         return (
           <section key={g.game_id} className="mb-3">
@@ -279,7 +291,7 @@ export function PropGroups({
                       {top.map((p, i) => (
                         <Fragment key={p.gsis_id}>
                           {i > 0 && " · "}
-                          {shortName(p.player_name)} {fmt(p.point_estimate, 1)}
+                          {shortName(p.player_name)} {fmt(meanOf(p), 1)}
                         </Fragment>
                       ))}
                     </span>

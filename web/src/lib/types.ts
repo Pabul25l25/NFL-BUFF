@@ -54,6 +54,7 @@ export interface PropPrediction {
   is_home: boolean | null;
   quantiles?: string | null;
   poisson_lambda?: number | null;
+  mean_estimate: number | null;
   receiving_yards: number | null;
   rushing_yards: number | null;
   receptions: number | null;

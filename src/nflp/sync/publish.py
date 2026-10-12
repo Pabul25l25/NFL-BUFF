@@ -90,7 +90,8 @@ _QUERY_PREDICTIONS_PROPS = f"""
     SELECT p.game_id, p.gsis_id, p.model_id, p.target,
            p.point_estimate, p.lower_80, p.upper_80,
            p.explanation_es, p.shap_values, p.predicted_at, p.as_of_ts,
-           p.quantiles,
+           p.quantiles, p.nb_dispersion,
+           COALESCE(p.mean_estimate, p.point_estimate) AS mean_estimate,
            CASE WHEN p.target IN ({", ".join(repr(t) for t in _COUNT_TARGETS)})
                 THEN COALESCE(p.poisson_lambda, p.point_estimate)
            END AS poisson_lambda,

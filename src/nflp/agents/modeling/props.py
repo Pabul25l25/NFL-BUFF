@@ -14,7 +14,10 @@ distribución entera. Desde la v2 la distribución depende del jugador:
   LightGBM cuantil, monótona y calibrada de forma conformal sobre la temporada
   de calibración (ver ``distributions.py``).
 * **Conteos dispersos** (touchdowns, sacks): Poisson con ``λ`` = predicción de
-  un modelo con objetivo Poisson (una media, nunca la mediana).
+  un modelo con objetivo Poisson (una media, nunca la mediana). Donde los
+  datos están sobredispersos (sacks, ver ``COUNT_DISTRIBUTION``) se sirve una
+  binomial negativa con la misma media y el tamaño ``r`` ajustado en la
+  temporada de calibración.
 
 La estimación puntual de los continuos usa el objetivo elegido por target en
 un walk-forward (L1, L2, Huber o Tweedie; ver ``PROP_POINT_OBJECTIVE``).
@@ -42,10 +45,11 @@ import pandas as pd
 from nflp.agents.modeling.distributions import (
     FINE_LEVELS,
     QUANTILE_LEVELS,
+    NegativeBinomialDistribution,
     PoissonDistribution,
     QuantileGridDistribution,
+    crps_count_rows,
     crps_fine_rows,
-    crps_poisson_rows,
     crps_quantile_grid_rows,
     interval_coverage,
     lognormal_quantiles,
@@ -253,6 +257,20 @@ CONTINUOUS_PROPS: frozenset[str] = frozenset(
     {"receiving_yards", "rushing_yards", "receptions", "passing_yards"}
 )
 
+# Distribución servida de cada conteo. La media es siempre la del modelo con
+# objetivo Poisson; "negbin" añade el tamaño r ajustado en calibración (ver
+# ``NegativeBinomialDistribution``). Se elige NB solo donde mejora CRPS y
+# cobertura en validación frente a la Poisson con el mismo modelo de media
+# (evaluación de props v2.1, 2024-2025): sacks_suffered está sobredisperso
+# (var/media ≈ 1,4 y cobertura Poisson 0,72); en los touchdowns la NB no
+# mejora y se mantiene la Poisson.
+COUNT_DISTRIBUTION: dict[str, str] = {
+    "receiving_tds": "poisson",
+    "rushing_tds": "poisson",
+    "passing_tds": "poisson",
+    "sacks_suffered": "negbin",
+}
+
 # Suelo de la rejilla de cuantiles. Las yardas de carrera pueden ser negativas
 # (rodillas del QB, pérdidas tras placaje), así que no se recortan.
 QUANTILE_LOWER_BOUND: dict[str, float | None] = {"rushing_yards": None}
@@ -435,8 +453,7 @@ class PropModel:
     legacy: bool = False
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        aligned = X.reindex(columns=self.feature_names).astype(float)
-        return np.maximum(self.model.predict(aligned), 0.0)  # type: ignore[attr-defined]
+        return served_point(self.model, self.distribution, X, self.feature_names)
 
     # ------------------------------------------------- distribución servida
 
@@ -462,6 +479,17 @@ class PropModel:
 # ---------------------------------------------------------------------------
 
 
+def served_point(model: Any, distribution: Any, X: pd.DataFrame, feature_names: list[str]) -> np.ndarray:
+    """Estimación puntual servida: predicción del modelo (≥ 0) más, en la
+    rejilla v2, el desplazamiento conformal de la mediana ajustado en
+    calibración (``QuantileGridDistribution.calibrate_point``)."""
+    aligned = X.reindex(columns=feature_names).astype(float)
+    raw = np.maximum(np.asarray(model.predict(aligned), dtype=float), 0.0)
+    if getattr(distribution, "kind", "lognormal") == "quantile_grid":
+        return distribution.shift_point(raw)
+    return raw
+
+
 def served_quantiles(distribution: Any, point: np.ndarray, X: pd.DataFrame) -> np.ndarray:
     kind = getattr(distribution, "kind", "lognormal")
     if kind == "lognormal":
@@ -485,12 +513,38 @@ def served_std(distribution: Any, point: np.ndarray, X: pd.DataFrame) -> np.ndar
     return distribution.std(point, X)
 
 
+def served_mean(distribution: Any, point: np.ndarray, X: pd.DataFrame, *, target: str | None = None) -> np.ndarray:
+    """Valor esperado de la distribución servida (``mean_estimate``).
+
+    * Poisson → λ; binomial negativa → μ (la predicción del modelo de media).
+    * Rejilla → media implícita de la rejilla con colas en escala normal
+      (``distributions.grid_mean``).
+    * Log-normal heredada → en conteos, la estimación puntual (es el λ con el
+      que el parlay sirve esos conteos); en continuos, la media de su función
+      cuantil con 200 niveles.
+    """
+    kind = getattr(distribution, "kind", "lognormal")
+    if kind != "lognormal":
+        return np.asarray(distribution.mean(point, X), dtype=float)
+    point = np.asarray(point, dtype=float)
+    if target in SPARSE_COUNT_PROPS:
+        return np.maximum(point, 0.0)
+    return lognormal_quantiles(distribution, point, FINE_LEVELS).mean(axis=1)
+
+
+def served_dispersion(distribution: Any, point: np.ndarray) -> np.ndarray:
+    """Tamaño ``r`` de la binomial negativa por fila (NaN si la distribución no es NB)."""
+    if getattr(distribution, "kind", "lognormal") == "negbin":
+        return np.asarray(distribution.size(point), dtype=float)
+    return np.full(np.asarray(point).shape, np.nan)
+
+
 def served_crps_rows(
     distribution: Any, y: np.ndarray, point: np.ndarray, X: pd.DataFrame, *, exact: bool = False
 ) -> np.ndarray:
     """CRPS por fila de la distribución que se sirve.
 
-    * Poisson → CRPS exacto.
+    * Poisson y binomial negativa → CRPS exacto.
     * Rejilla nueva → CRPS de la rejilla p05..p95.
     * Log-normal heredada → rejilla p05..p95 (comparable con la nueva en los
       continuos) o, con ``exact=True``, rejilla fina de 200 niveles ≈ CRPS
@@ -498,7 +552,9 @@ def served_crps_rows(
     """
     kind = getattr(distribution, "kind", "lognormal")
     if kind == "poisson":
-        return crps_poisson_rows(y, distribution.lam(point))
+        return crps_count_rows(y, distribution.lam(point))
+    if kind == "negbin":
+        return distribution.crps_rows(y, point)
     if kind == "lognormal" and exact:
         point = np.asarray(point, dtype=float)
         return crps_fine_rows(
@@ -517,9 +573,9 @@ def served_crps(
 
 
 def served_coverage(distribution: Any, y: np.ndarray, point: np.ndarray, X: pd.DataFrame) -> float:
-    """Cobertura del 80 %: intervalo literal (continuos) o PIT aleatorizado (Poisson)."""
+    """Cobertura del 80 %: intervalo literal (continuos) o PIT aleatorizado (Poisson/NB)."""
     kind = getattr(distribution, "kind", "lognormal")
-    if kind == "poisson":
+    if kind in {"poisson", "negbin"}:
         return distribution.coverage(y, point)
     lower, upper = served_interval(distribution, point, X)
     return interval_coverage(y, lower, upper)
@@ -623,7 +679,14 @@ def train_prop_model(
         model.fit(X_train, fit_y)
 
     distribution: Any
-    if target in SPARSE_COUNT_PROPS:
+    if target in SPARSE_COUNT_PROPS and COUNT_DISTRIBUTION.get(target, "poisson") == "negbin":
+        distribution = NegativeBinomialDistribution()
+        if with_distribution and not calib.empty:
+            # Dispersión ajustada SOLO con la temporada de calibración: la media
+            # sale del modelo entrenado sin ella, así que es fuera de muestra.
+            calib_point = np.maximum(model.predict(calib[features].astype(float)), 0.0)
+            distribution.fit(calib[target].astype(float).to_numpy(), calib_point)
+    elif target in SPARSE_COUNT_PROPS:
         distribution = PoissonDistribution()
     else:
         distribution = QuantileGridDistribution(
@@ -633,7 +696,11 @@ def train_prop_model(
         if with_distribution:
             distribution.fit(X_train, y_train.to_numpy(), final_params)
             if not calib.empty:
-                distribution.calibrate(calib[features].astype(float), calib[target].astype(float).to_numpy())
+                calib_X = calib[features].astype(float)
+                calib_y = calib[target].astype(float).to_numpy()
+                distribution.calibrate(calib_X, calib_y)
+                # Mediana puntual centrada en calibración (el objetivo L1 no cambia).
+                distribution.calibrate_point(calib_y, np.maximum(model.predict(calib_X), 0.0))
 
     return PropModel(
         target=target,
@@ -749,6 +816,7 @@ def filter_prop_rows(frame: pd.DataFrame, target: str, min_snaps: int = 10) -> p
 
 __all__ = [
     "CONTINUOUS_PROPS",
+    "COUNT_DISTRIBUTION",
     "LEGACY_PROP_FEATURE_SETS",
     "PROP_FEATURE_SETS",
     "PROP_MIN_TRAIN_SEASON",
@@ -761,7 +829,10 @@ __all__ = [
     "served_coverage",
     "served_crps",
     "served_crps_rows",
+    "served_dispersion",
     "served_interval",
+    "served_mean",
+    "served_point",
     "served_quantiles",
     "served_std",
     "train_prop_model",

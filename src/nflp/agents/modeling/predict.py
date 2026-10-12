@@ -243,7 +243,10 @@ class Predictor:
         from nflp.agents.modeling.distributions import quantiles_to_json
         from nflp.agents.modeling.props import (
             filter_prop_rows,
+            served_dispersion,
             served_interval,
+            served_mean,
+            served_point,
             served_quantiles,
             served_std,
         )
@@ -297,12 +300,19 @@ class Predictor:
 
         model = artifact["model"]
         distribution = artifact["distribution"]
-        prediction = np.maximum(model.predict(X), 0.0)
+        # Punto servido: modelo L1/Poisson más, en la rejilla v2, el
+        # desplazamiento de la mediana ajustado en calibración.
+        prediction = served_point(model, distribution, X, feature_names)
+        point_shift = (
+            float(getattr(distribution, "point_shift", 0.0))
+            if getattr(distribution, "kind", "") == "quantile_grid" else 0.0
+        )
 
-        # Distribución servida: rejilla conformal (continuos v2), Poisson
-        # (conteos v2) o la log-normal global de los artefactos v1. Las tres
-        # exponen la misma interfaz vía served_*; la rejilla p05..p95 se
-        # persiste siempre, λ solo cuando la distribución es Poisson.
+        # Distribución servida: rejilla conformal (continuos v2), Poisson o
+        # binomial negativa (conteos v2) o la log-normal global de los
+        # artefactos v1. Todas exponen la misma interfaz vía served_*; la
+        # rejilla p05..p95 y la media (mean_estimate) se persisten siempre, λ
+        # solo cuando la distribución es Poisson y el tamaño r solo en la NB.
         kind = getattr(distribution, "kind", "lognormal")
         grid = served_quantiles(distribution, prediction, frame)
         lower, upper = served_interval(distribution, prediction, frame)
@@ -318,6 +328,8 @@ class Predictor:
         result["lower_80"], result["upper_80"] = lower, upper
         result["quantiles"] = quantiles_to_json(grid)
         result["poisson_lambda"] = prediction if kind == "poisson" else np.nan
+        result["mean_estimate"] = served_mean(distribution, prediction, frame, target=target)
+        result["nb_dispersion"] = served_dispersion(distribution, prediction)
         # Sin probabilidad: un prop no tiene línea propia contra la que medirla.
         result["probability"] = np.nan
         result["confidence_level"] = "media"
@@ -339,7 +351,8 @@ class Predictor:
             )
             for i in range(len(frame))
         ]
-        result["shap_base_value"] = base_value
+        # La base SHAP incluye el desplazamiento constante del punto servido.
+        result["shap_base_value"] = base_value + point_shift
         result["explanation_es"] = [
             describe_contributions(
                 dict(zip(feature_names, matrix[i].astype(float), strict=False)), X.iloc[i]
@@ -359,7 +372,8 @@ class Predictor:
             keep = [
                 "prediction_id", "game_id", "model_id", "target", "gsis_id",
                 "point_estimate", "probability", "pred_std", "lower_80", "upper_80",
-                "quantiles", "poisson_lambda", "team", "opponent_team", "is_home",
+                "quantiles", "poisson_lambda", "mean_estimate", "nb_dispersion",
+                "team", "opponent_team", "is_home",
                 "confidence_level", "shap_values", "shap_base_value", "explanation_es",
                 "is_shadow", "as_of_ts", "predicted_at",
             ]

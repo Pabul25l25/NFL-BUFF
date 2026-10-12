@@ -20,6 +20,14 @@ import {
   normCdf,
   parseOdds,
   poissonCdfAt,
+  poissonTable,
+  poissonInverse,
+  countTable,
+  countP0,
+  nbTable,
+  lgamma,
+  mulberry32,
+  anytimeTdProb,
   quantileInverse,
   toAmerican,
 } from "./parlay";
@@ -250,5 +258,67 @@ describe("utilidades", () => {
     expect(decodeAdd("00-1:receiving_yards:over:57.5")).toEqual({ ...l, gsis_id: "00-1" });
     expect(decodeAdd("x")).toBeNull();
     expect(decodeLeg("p:a:b:sideways:1")).toBeNull();
+  });
+});
+
+describe("binomial negativa", () => {
+  it("r enorme ~ Poisson", () => {
+    const nb = countTable(2.3, 1e8);
+    const po = poissonTable(2.3);
+    for (let k = 0; k < 8; k++) expect(Math.abs(nb[k] - po[k])).toBeLessThan(1e-5);
+  });
+  it("sin dispersion valida usa Poisson", () => {
+    expect(countTable(1.2, null)).toEqual(poissonTable(1.2));
+    expect(countTable(1.2, 0)).toEqual(poissonTable(1.2));
+    expect(countTable(1.2, NaN)).toEqual(poissonTable(1.2));
+  });
+  it("media y varianza por muestreo", () => {
+    const lam = 1.5;
+    const r = 2;
+    const t = nbTable(lam, r);
+    const rand = mulberry32(7);
+    const n = 200000;
+    let s = 0;
+    let s2 = 0;
+    for (let i = 0; i < n; i++) {
+      const x = poissonInverse(t, rand());
+      s += x;
+      s2 += x * x;
+    }
+    const mean = s / n;
+    const v = s2 / n - mean * mean;
+    expect(mean).toBeCloseTo(lam, 1);
+    expect(Math.abs(v - (lam + (lam * lam) / r))).toBeLessThan(0.1);
+  });
+  it("P(X>=1) analitico y en la simulacion", () => {
+    const lam = 0.6;
+    const r = 1.5;
+    expect(1 - nbTable(lam, r)[0]).toBeCloseTo(1 - Math.pow(r / (r + lam), r), 10);
+    expect(countP0(lam, r)).toBeCloseTo(Math.pow(r / (r + lam), r), 10);
+    const i = inputs();
+    i.markets[2].dispersion = r;
+    i.markets[2].lambda = lam;
+    i.markets[3].lambda = 0.01;
+    const p = evaluateParlay(i, [{ kind: "anytime_td", gsis_id: "A" }]).legs[0].p;
+    const exact = 1 - Math.pow(r / (r + lam), r) * countP0(0.01);
+    expect(Math.abs(p - exact)).toBeLessThan(0.012);
+    expect(anytimeTdProb(i, "A")).toBeCloseTo(exact, 10);
+  });
+  it("lgamma", () => {
+    expect(lgamma(5)).toBeCloseTo(Math.log(24), 10);
+    expect(lgamma(0.5)).toBeCloseTo(Math.log(Math.sqrt(Math.PI)), 10);
+  });
+});
+
+describe("mercado continuo con lambda", () => {
+  it("usa la malla de cuantiles aunque lambda venga informado", () => {
+    const base = evaluateParlay(inputs(), [over("A", 110)]).legs[0].p;
+    const i = inputs();
+    i.markets[0].lambda = 3; // media; no debe tratarse como conteo
+    i.markets[0].dispersion = 2;
+    expect(hasMarket(i, "A", "receiving_yards")).toBe(true);
+    const p = evaluateParlay(i, [over("A", 110)]).legs[0].p;
+    expect(p).toBe(base);
+    expect(Math.abs(p - (1 - normCdf(0.5)))).toBeLessThan(0.012);
   });
 });

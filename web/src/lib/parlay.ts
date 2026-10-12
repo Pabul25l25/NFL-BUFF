@@ -34,8 +34,12 @@ export interface ParlayMarket {
   point_estimate: number | null;
   /** 19 cuantiles p05..p95 (continuos) */
   quantiles: number[] | null;
-  /** tasa de Poisson (conteos) */
+  /** media de la distribucion de conteos (tasa de Poisson / media de la binomial negativa) */
   lambda: number | null;
+  /** tamano r de la binomial negativa (var = lambda + lambda^2 / r); null/invalido = Poisson */
+  dispersion?: number | null;
+  /** media esperada (point_estimate es la mediana / linea 50/50) */
+  mean_estimate?: number | null;
 }
 
 export interface ParlayInputs {
@@ -174,6 +178,62 @@ export function quantileInverse(q: number[], u: number): number {
     v = s[i] + (s[i + 1] - s[i]) * (pos - i);
   }
   return Math.max(0, v);
+}
+
+/** log Gamma (Lanczos, g=7, n=9). */
+export function lgamma(x: number): number {
+  if (x < 0.5) return Math.log(Math.PI / Math.abs(Math.sin(Math.PI * x))) - lgamma(1 - x);
+  const g = [
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059,
+    12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+  ];
+  const xx = x - 1;
+  let a = g[0];
+  const t = xx + 7.5;
+  for (let i = 1; i < 9; i++) a += g[i] / (xx + i);
+  return 0.5 * Math.log(2 * Math.PI) + (xx + 0.5) * Math.log(t) - t + Math.log(a);
+}
+
+/** Dispersion valida (r finito > 0) => binomial negativa; si no, Poisson. */
+export const hasDispersion = (r: number | null | undefined): r is number =>
+  typeof r === "number" && Number.isFinite(r) && r > 0;
+
+/** log pmf de la binomial negativa con media lambda y tamano r (log-espacio). */
+export function nbLogPmf(k: number, lambda: number, r: number): number {
+  if (lambda <= 0) return k === 0 ? 0 : -Infinity;
+  const lr = Math.log(r + lambda);
+  return lgamma(k + r) - lgamma(r) - lgamma(k + 1) + r * (Math.log(r) - lr) + k * (Math.log(lambda) - lr);
+}
+
+/** Tabla CDF de la binomial negativa (media lambda, tamano r) hasta ~1 - 1e-12. Con r enorme tiende a Poisson. */
+export function nbTable(lambda: number, r: number): number[] {
+  const lam = Math.max(0, lambda);
+  const cdf: number[] = [];
+  let acc = 0;
+  const maxK = Math.min(5000, Math.ceil(lam + 40 * Math.sqrt(lam + (lam * lam) / r) + 50));
+  for (let k = 0; k <= maxK; k++) {
+    acc += Math.exp(nbLogPmf(k, lam, r));
+    cdf.push(Math.min(1, acc));
+    if (acc >= 1 - 1e-12) break;
+  }
+  return cdf;
+}
+
+/** Tabla CDF del conteo: binomial negativa si hay dispersion valida, Poisson en otro caso. */
+export function countTable(lambda: number, dispersion?: number | null): number[] {
+  return hasDispersion(dispersion) ? nbTable(lambda, dispersion) : poissonTable(lambda);
+}
+
+/** P(X = 0) del conteo. */
+export function countP0(lambda: number, dispersion?: number | null): number {
+  const lam = Math.max(0, lambda);
+  return hasDispersion(dispersion) ? Math.exp(dispersion * (Math.log(dispersion) - Math.log(dispersion + lam))) : Math.exp(-lam);
+}
+
+/** CDF del conteo en k. */
+export function countCdfAt(lambda: number, k: number, dispersion?: number | null): number {
+  const t = countTable(lambda, dispersion);
+  return k < 0 ? 0 : k >= t.length ? 1 : t[k];
 }
 
 /** Tabla CDF de Poisson(lambda) hasta cubrir ~1 - 1e-12. */
@@ -338,7 +398,7 @@ export function halfLine(v: number): number {
 type Latent =
   | { kind: "normal"; mu: number; sigma: number }
   | { kind: "quantile"; q: number[] }
-  | { kind: "poisson"; table: number[] };
+  | { kind: "count"; table: number[] };
 
 function marketOf(inputs: ParlayInputs, gsis: string, target: string): ParlayMarket | undefined {
   return inputs.markets.find((m) => m.gsis_id === gsis && m.target === target);
@@ -363,7 +423,7 @@ function latentFor(inputs: ParlayInputs, key: string): Latent | null {
   const m = marketOf(inputs, gsis, target);
   if (!usableMarket(m)) return null;
   if (CONTINUOUS_TARGETS.includes(target)) return { kind: "quantile", q: m.quantiles as number[] };
-  return { kind: "poisson", table: poissonTable(m.lambda as number) };
+  return { kind: "count", table: countTable(m.lambda as number, m.dispersion) };
 }
 
 /** Claves latentes que necesita una leg (vacio si es de primer TD o no hay datos). */
@@ -421,8 +481,16 @@ export function firstTdProb(inputs: ParlayInputs, gsis: string): number | null {
 
 /** Probabilidad analitica de anotar TD (sin correlacion entre recepcion y carrera del mismo jugador). */
 export function anytimeTdProb(inputs: ParlayInputs, gsis: string): number | null {
-  const r = tdRate(inputs, gsis);
-  return r == null ? null : 1 - Math.exp(-r);
+  let p0 = 1;
+  let any = false;
+  for (const t of ["receiving_tds", "rushing_tds"]) {
+    const m = marketOf(inputs, gsis, t);
+    if (usableMarket(m)) {
+      p0 *= countP0(m.lambda as number, m.dispersion);
+      any = true;
+    }
+  }
+  return any ? 1 - p0 : null;
 }
 
 // ---------------------------------------------------------------- evaluacion

@@ -53,7 +53,7 @@ export async function GET(req: NextRequest) {
   const [propRows, corrRows, calRows] = await Promise.all([
     sql.query(
       `SELECT gsis_id, player_name, position, team, is_home, target,
-              point_estimate, quantiles, poisson_lambda
+              point_estimate, quantiles, poisson_lambda, mean_estimate, nb_dispersion
        FROM pub_predictions_props
        WHERE game_id = $1
        ORDER BY player_name, target`,
@@ -88,7 +88,9 @@ export async function GET(req: NextRequest) {
         target: r.target,
         point_estimate: num(r.point_estimate),
         quantiles: Array.isArray(q) && q.length === 19 ? q.map(Number) : null,
-        lambda: num(r.poisson_lambda),
+        // Conteos: media de la distribución servida; si falta, la tasa de Poisson.
+        lambda: num(r.mean_estimate) ?? num(r.poisson_lambda),
+        dispersion: num(r.nb_dispersion),
       };
     });
 

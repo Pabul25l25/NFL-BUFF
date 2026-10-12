@@ -300,3 +300,43 @@ def test_simulated_parlays_copula_beats_independence_on_correlated_data() -> Non
     parlays = simulate_parlays(frame, model, n_per_game=10, n_sims=4000, rng=np.random.default_rng(10))
     y = parlays["hit"].to_numpy(float)
     assert ece_score(parlays["p_copula"], y) < ece_score(parlays["p_indep"], y)
+
+
+# ------------------------------------------------------ binomial negativa
+
+
+def test_randomized_pit_negbin_is_uniform_and_poisson_is_not() -> None:
+    """Conteos sobredispersos (sacks): el PIT es uniforme con la CDF de la NB."""
+    from nflp.agents.modeling.parlay import marginal_cdf
+
+    rng = np.random.default_rng(8)
+    n = 20000
+    mu = rng.uniform(1.0, 4.0, size=n)
+    r = np.full(n, 5.0)
+    y = rng.negative_binomial(r, r / (r + mu)).astype(float)
+    u = randomized_pit(np.full(n, "negbin"), y, rng, lam=mu, size=r)
+    assert kstest(u, "uniform").pvalue > 0.01
+    # Con la Poisson de la misma media las colas se quedan cortas.
+    u_pois = randomized_pit(np.full(n, "poisson"), y, rng, lam=mu)
+    assert kstest(u_pois, "uniform").pvalue < 1e-6
+    # La CDF de la pierna NB en una línea x,5 es la de scipy.
+    from scipy.stats import nbinom
+
+    cdf = marginal_cdf(np.array(["negbin"]), np.array([2.5]), lam=np.array([2.0]), size=np.array([5.0]))
+    assert cdf[0] == pytest.approx(nbinom.cdf(2, 5.0, 5.0 / 7.0))
+
+
+def test_prop_marginals_carry_nb_size() -> None:
+    from nflp.agents.modeling.distributions import NegativeBinomialDistribution
+    from nflp.agents.modeling.parlay import prop_marginals
+
+    class _Model:
+        distribution = NegativeBinomialDistribution(log_size_intercept=float(np.log(5.0)))
+
+        def predict(self, frame: pd.DataFrame) -> np.ndarray:
+            return frame["mu"].to_numpy()
+
+    marg = prop_marginals("sacks_suffered", _Model(), pd.DataFrame({"mu": [1.5, 2.5]}))
+    assert marg["kind"] == "negbin"
+    np.testing.assert_allclose(marg["lam"], [1.5, 2.5])
+    np.testing.assert_allclose(marg["size"], [5.0, 5.0])
