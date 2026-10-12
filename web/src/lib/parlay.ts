@@ -589,3 +589,160 @@ export function evaluateParlay(inputs: ParlayInputs, legs: Leg[], opts: EvalOpti
     bookDecimal,
   };
 }
+
+// ---------------------------------------------------------------- ticket multi-partido
+
+export const MAX_LEGS = 20;
+export const MAX_GAMES = 10;
+export const MAX_ABS_LINE = 1000;
+
+/** Una seleccion del ticket: la leg mas el partido al que pertenece. */
+export interface TicketLeg {
+  gameId: string;
+  leg: Leg;
+}
+
+export const ticketLegKey = (t: TicketLeg) => `${t.gameId}~${legKey(t.leg)}`;
+
+/** `<game_id>~<legcode>`; sin `~` (formato antiguo) usa `defaultGameId`. */
+export function decodeTicketLeg(s: string, defaultGameId = ""): TicketLeg | null {
+  const i = s.indexOf("~");
+  const gameId = i >= 0 ? s.slice(0, i) : defaultGameId;
+  const leg = decodeLeg(i >= 0 ? s.slice(i + 1) : s);
+  return gameId && leg ? { gameId, leg } : null;
+}
+
+export function legLineOk(l: Leg): boolean {
+  return !("line" in l) || (typeof l.line === "number" && Math.abs(l.line) <= MAX_ABS_LINE);
+}
+
+/** Agrega una seleccion respetando duplicados y limites. `error` explica un rechazo por limite. */
+export function addToTicket(ticket: TicketLeg[], t: TicketLeg): { ticket: TicketLeg[]; error?: string } {
+  if (!legLineOk(t.leg)) return { ticket };
+  const k = ticketLegKey(t);
+  if (ticket.some((x) => ticketLegKey(x) === k)) return { ticket };
+  if (ticket.length >= MAX_LEGS) return { ticket, error: `Máximo ${MAX_LEGS} selecciones por ticket.` };
+  if (!ticket.some((x) => x.gameId === t.gameId) && new Set(ticket.map((x) => x.gameId)).size >= MAX_GAMES) {
+    return { ticket, error: `Máximo ${MAX_GAMES} partidos por ticket.` };
+  }
+  return { ticket: [...ticket, t] };
+}
+
+/**
+ * Reconstruye el ticket desde URL/almacenamiento. Acepta el formato nuevo (`legs=<game>~<leg>,...`),
+ * el antiguo (`game_id=..&legs=<leg>,...`) y los enlaces de Props (`game_id=..&add=<id>:<target>:over:<line>`).
+ */
+export function decodeTicket(src: { gameId?: string; legs?: string[]; add?: string[] }): TicketLeg[] {
+  let ticket: TicketLeg[] = [];
+  const gameId = src.gameId ?? "";
+  for (const e of src.legs ?? []) {
+    const t = decodeTicketLeg(e, gameId);
+    if (t) ticket = addToTicket(ticket, t).ticket;
+  }
+  if (gameId) {
+    for (const a of src.add ?? []) {
+      const leg = decodeAdd(a);
+      if (leg) ticket = addToTicket(ticket, { gameId, leg }).ticket;
+    }
+  }
+  return ticket;
+}
+
+export interface TicketLegResult extends LegResult {
+  gameId: string;
+  key: string;
+}
+
+export interface TicketGameResult {
+  gameId: string;
+  /** false si no hay datos del partido: sus legs no cuentan */
+  loaded: boolean;
+  legs: TicketLegResult[];
+  /** conjunta del partido (con correlacion); null si no tiene legs disponibles */
+  joint: number | null;
+  independent: number | null;
+}
+
+export interface TicketResult {
+  games: TicketGameResult[];
+  /** producto de las conjuntas por partido (partidos independientes entre si) */
+  joint: number;
+  /** producto de todos los marginales */
+  independent: number;
+  activeLegs: number;
+  unavailableLegs: number;
+  fairDecimal: number | null;
+  fairAmerican: number | null;
+  approx: boolean;
+  repairShrink: number;
+  sims: number;
+  ev: number | null;
+  bookDecimal: number | null;
+}
+
+/** Evalua un ticket multi-partido: correlacion dentro de cada partido, independencia entre partidos. */
+export function evaluateTicket(
+  inputsByGame: Record<string, ParlayInputs | undefined>,
+  ticket: TicketLeg[],
+  opts: EvalOptions = {}
+): TicketResult {
+  const sims = opts.sims ?? 20000;
+  const order: string[] = [];
+  for (const t of ticket) if (!order.includes(t.gameId)) order.push(t.gameId);
+
+  let joint = 1;
+  let independent = 1;
+  let active = 0;
+  let unavailable = 0;
+  let approx = false;
+  let repairShrink = 0;
+
+  const games: TicketGameResult[] = order.map((gameId) => {
+    const mine = ticket.filter((t) => t.gameId === gameId);
+    const inputs = inputsByGame[gameId];
+    if (!inputs) {
+      unavailable += mine.length;
+      return {
+        gameId,
+        loaded: false,
+        joint: null,
+        independent: null,
+        legs: mine.map((t) => ({
+          leg: t.leg, gameId, key: ticketLegKey(t), available: false, reason: "no disponible", p: 0, approx: false,
+        })),
+      };
+    }
+    const r = evaluateParlay(inputs, mine.map((t) => t.leg), { sims, seed: opts.seed });
+    const legs = r.legs.map((l, i) => ({ ...l, gameId, key: ticketLegKey(mine[i]) }));
+    const n = legs.filter((l) => l.available).length;
+    unavailable += legs.length - n;
+    active += n;
+    if (r.approx) approx = true;
+    repairShrink = Math.max(repairShrink, r.repairShrink);
+    if (n > 0) {
+      joint *= r.joint;
+      independent *= r.independent;
+    }
+    return { gameId, loaded: true, legs, joint: n > 0 ? r.joint : null, independent: n > 0 ? r.independent : null };
+  });
+
+  if (active === 0) {
+    joint = 0;
+    independent = 0;
+  }
+  const bookDecimal = opts.bookDecimal ?? null;
+  return {
+    games,
+    joint,
+    independent,
+    activeLegs: active,
+    unavailableLegs: unavailable,
+    fairDecimal: active === 0 ? null : fairDecimal(joint),
+    fairAmerican: active === 0 ? null : toAmerican(joint),
+    approx,
+    repairShrink,
+    sims,
+    ev: bookDecimal != null && active > 0 ? joint * bookDecimal - 1 : null,
+    bookDecimal,
+  };
+}

@@ -172,6 +172,54 @@ def predict_props_task(target: str, season: int | None = None, week: int | None 
     return batch.n_predictions if batch else 0
 
 
+@task(name="predecir-parlay")
+def predict_parlay_task(season: int | None = None, week: int | None = None) -> dict[str, Any]:
+    """Matrices de correlación de parlays del mismo partido (``parlay_game_*``).
+
+    Paso no crítico: se apoya en las predicciones de props y de partido ya
+    guardadas, así que va después de ellas. Si falla (sin modelo de parlay, sin
+    props), se registra y se sigue: no debe bloquear la publicación de las
+    predicciones de partido y de props, que ya están persistidas.
+    """
+    logger = get_run_logger()
+    try:
+        from nflp.agents.modeling.parlay import ParlayAgent
+
+        legs, corr = ParlayAgent().predict(season=season, week=week)
+    except Exception as exc:  # noqa: BLE001 - paso no crítico, ver docstring
+        logger.warning("Parlay falló, se ignora y se sigue con la publicación: %s", exc)
+        return {"skipped": True, "error": str(exc), "games": 0}
+
+    if corr.empty:
+        logger.warning("Sin matrices de parlay (¿falta `nflp model parlay-corr`?).")
+    else:
+        logger.info("Parlay: %d partidos con matriz, %d con piernas de partido.", len(corr), len(legs))
+    return {"skipped": False, "error": None, "games": len(corr)}
+
+
+@task(name="entrenar-parlay")
+def train_parlay_task(refresh: bool = False) -> dict[str, Any]:
+    """Reajusta la cópula de parlays (equivale a ``nflp model parlay-corr``).
+
+    Con caché (``refresh=False``) tarda ~1 min; con ``refresh=True`` recalcula
+    las predicciones fuera de muestra (~20 min). No reintenta: un fallo aquí es
+    de datos, no transitorio. Es no crítico: si falla se registra y se sigue.
+    """
+    logger = get_run_logger()
+    try:
+        from nflp.agents.modeling.parlay import ParlayAgent
+
+        agent = ParlayAgent()
+        result = agent.fit(refresh=refresh)
+        _, corr = agent.predict(model=(result.model_id, result.model))
+    except Exception as exc:  # noqa: BLE001 - paso no crítico, ver docstring
+        logger.warning("Reentrenamiento de parlay falló, se ignora: %s", exc)
+        return {"skipped": True, "error": str(exc)}
+
+    logger.info("Parlay %s (%s): %d partidos regenerados.", result.model_id, result.model.kind, len(corr))
+    return {"skipped": False, "error": None, "model_id": result.model_id, "games": len(corr)}
+
+
 @task(name="backtest")
 def backtest_task(target: str) -> dict[str, Any]:
     """Backtesting Agent: walk-forward contra todos los baselines."""
@@ -253,7 +301,9 @@ def weekly_flow(season: int | None = None, week: int | None = None) -> dict[str,
     3. **Auditoría anti-leakage** — si falla, el flow se detiene aquí.
     4. **Reentrenamiento** — partidos y props, con el gate de over/underfitting.
     5. **Monitoreo** — decide si cada modelo nuevo reemplaza al de producción.
-    6. **Predicción** — la última, para que use siempre el modelo ya promovido.
+    6. **Predicción** — partidos, props y, al final, parlays (no crítico), para
+       que use siempre el modelo ya promovido.
+    7. **Publicación** — la última; sus fallos no tumban el flow.
     """
     setup_logging(get_settings().logging.level)
     logger = get_run_logger()
@@ -289,6 +339,9 @@ def weekly_flow(season: int | None = None, week: int | None = None) -> dict[str,
     for prop in settings.props.targets:
         predictions[prop] = predict_props_task(prop, season, week)
 
+    # --- 6b. parlay: tras props y partido (los usa), antes de publicar; no crítico ---
+    predictions["parlay"] = predict_parlay_task(season, week)
+
     # --- 7. publicación a la nube (opcional, para el frontend en Vercel) ---
     publishing = publish_task()
 
@@ -300,7 +353,9 @@ def weekly_flow(season: int | None = None, week: int | None = None) -> dict[str,
 
 
 @flow(name="nflp-reentrenamiento", description="Reentrenamiento con gate de promoción.")
-def retrain_flow(tune: bool = False, targets: list[str] | None = None) -> dict[str, Any]:
+def retrain_flow(
+    tune: bool = False, targets: list[str] | None = None, refresh_parlay: bool = False
+) -> dict[str, Any]:
     """Reentrena todos los objetivos y evalúa la promoción desde shadow.
 
     A diferencia de ``weekly_flow``, no ingiere datos nuevos ni predice — es
@@ -317,6 +372,9 @@ def retrain_flow(tune: bool = False, targets: list[str] | None = None) -> dict[s
     results = {target: train_model_task(target, tune) for target in targets}
     for prop in settings.props.targets:
         results[prop] = train_props_task(prop)
+
+    # Cópula de parlays: depende de los props recién entrenados (caché, sin refresh).
+    results["parlay"] = train_parlay_task(refresh=refresh_parlay)
 
     results["monitoreo"] = monitor_task()
     return results
@@ -351,12 +409,15 @@ def full_pipeline(seasons: list[int] | None = None, tune: bool = False) -> dict[
     for prop in settings.props.targets:
         results[prop] = train_props_task(prop)
 
+    results["parlay"] = train_parlay_task()
     results["monitoreo"] = monitor_task()
     results["predicciones"] = {
         target: predict_task(target) for target in settings.modeling.targets
     }
     for prop in settings.props.targets:
         results["predicciones"][prop] = predict_props_task(prop)
+    # Tras props; en un arranque desde cero el modelo de parlay se acaba de ajustar arriba.
+    results["predicciones"]["parlay"] = predict_parlay_task()
 
     results["backtest"] = {t: backtest_task(t) for t in settings.modeling.targets}
     return results

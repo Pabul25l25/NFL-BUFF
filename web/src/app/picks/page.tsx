@@ -2,19 +2,24 @@
 
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { useQuery } from "@tanstack/react-query";
+import { useQueries, useQuery } from "@tanstack/react-query";
 import { BottomNav } from "@/components/bottom-nav";
 import { GamePrediction } from "@/lib/types";
 import { upcomingWeek } from "@/lib/weeks";
 import {
   Leg,
+  MAX_GAMES,
+  MAX_LEGS,
   ParlayInputs,
   Side,
   TeamSide,
+  TicketLeg,
+  TicketResult,
+  addToTicket,
   anytimeTdProb,
-  decodeAdd,
-  decodeLeg,
+  decodeTicket,
   evaluateParlay,
+  evaluateTicket,
   firstTdProb,
   formatAmerican,
   halfLine,
@@ -22,12 +27,12 @@ import {
   legKey,
   parseOdds,
   tdRate,
+  ticketLegKey,
 } from "@/lib/parlay";
 import { MOCK_ENABLED, mockParlayInputs } from "@/lib/parlay-mock";
 
-const STORAGE_KEY = "picks:v1";
-const MAX_LEGS = 20;
-const MAX_ABS_LINE = 1000;
+const STORAGE_KEY = "picks:v2";
+const LEGACY_STORAGE_KEY = "picks:v1";
 
 interface InputsResult {
   data: ParlayInputs;
@@ -78,21 +83,26 @@ function playerName(inputs: ParlayInputs, id: string) {
 const sideText = (s: Side) => (s === "over" ? "Más de" : "Menos de");
 const fmtLine = (n: number) => (n > 0 ? `+${n}` : `${n}`);
 
-function describeLeg(leg: Leg, inputs: ParlayInputs): string {
-  const g = inputs.game;
+interface Teams {
+  home: string;
+  away: string;
+}
+
+function describeLeg(leg: Leg, inputs: ParlayInputs | undefined, g: Teams): string {
+  const name = (id: string) => (inputs ? playerName(inputs, id) : id);
   switch (leg.kind) {
     case "player":
-      return `${playerName(inputs, leg.gsis_id)} · ${marketLabel(leg.target)} · ${sideText(leg.side)} ${leg.line}`;
+      return `${name(leg.gsis_id)} · ${marketLabel(leg.target)} · ${sideText(leg.side)} ${leg.line}`;
     case "anytime_td":
-      return `${playerName(inputs, leg.gsis_id)} · Anota TD`;
+      return `${name(leg.gsis_id)} · Anota TD`;
     case "two_td":
-      return `${playerName(inputs, leg.gsis_id)} · 2+ TD`;
+      return `${name(leg.gsis_id)} · 2+ TD`;
     case "first_td":
-      return `${playerName(inputs, leg.gsis_id)} · Primer TD`;
+      return `${name(leg.gsis_id)} · Primer TD`;
     case "winner":
-      return `Ganador · ${leg.team === "home" ? g.home_team : g.away_team}`;
+      return `Gana ${leg.team === "home" ? g.home : g.away}`;
     case "spread":
-      return `Spread · ${leg.team === "home" ? g.home_team : g.away_team} ${fmtLine(leg.line)}`;
+      return `Spread · ${leg.team === "home" ? g.home : g.away} ${fmtLine(leg.line)}`;
     case "total":
       return `Total · ${sideText(leg.side)} ${leg.line}`;
   }
@@ -120,43 +130,44 @@ const fieldStyle = { background: "var(--surface)", color: "var(--text)", border:
 const btn = "min-h-[40px] rounded-lg px-3 py-2 text-[13px] font-semibold";
 const label = "text-[11px] font-semibold uppercase tracking-wider";
 
-function readInitial(sp: URLSearchParams): { gameId: string; legs: Leg[] } {
+function readInitial(sp: URLSearchParams): { gameId: string; legs: TicketLeg[] } {
   let gameId = sp.get("game_id") ?? "";
   let encoded: string[] = (sp.get("legs") ?? "").split(",").filter(Boolean);
   if (!gameId && encoded.length === 0) {
-    try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw) {
+    for (const key of [STORAGE_KEY, LEGACY_STORAGE_KEY]) {
+      try {
+        const raw = window.localStorage.getItem(key);
+        if (!raw) continue;
         const v = JSON.parse(raw) as { game_id?: unknown; legs?: unknown };
         if (typeof v.game_id === "string") gameId = v.game_id;
         if (Array.isArray(v.legs)) encoded = v.legs.filter((x): x is string => typeof x === "string");
+        break;
+      } catch {
+        // almacenamiento no disponible o JSON invalido: se ignora
       }
-    } catch {
-      // almacenamiento no disponible o JSON invalido: se ignora
     }
   }
-  const legs: Leg[] = [];
-  const seen = new Set<string>();
-  const push = (l: Leg | null) => {
-    if (!l || legs.length >= MAX_LEGS) return;
-    if ("line" in l && typeof l.line === "number" && !(Math.abs(l.line) <= MAX_ABS_LINE)) return;
-    if (!seen.has(legKey(l))) {
-      seen.add(legKey(l));
-      legs.push(l);
-    }
-  };
-  for (const e of encoded) push(decodeLeg(e));
-  if (gameId) for (const a of sp.getAll("add")) push(decodeAdd(a));
+  const legs = decodeTicket({ gameId, legs: encoded, add: sp.getAll("add") });
   return { gameId, legs };
 }
 
 // ------------------------------------------------------------ pagina
 
+interface GameStatus {
+  id: string;
+  inputs?: ParlayInputs;
+  mock: boolean;
+  loading: boolean;
+  failed: boolean;
+}
+
+const gameLabel = (g: { away_team: string; home_team: string }) => `${g.away_team} @ ${g.home_team}`;
+
 function PicksInner() {
   const searchParams = useSearchParams();
   const [init] = useState(() => readInitial(searchParams));
-  const [gameId, setGameId] = useState(init.gameId);
-  const [legs, setLegs] = useState<Leg[]>(init.legs);
+  const [browseId, setBrowseId] = useState(init.gameId);
+  const [legs, setLegs] = useState<TicketLeg[]>(init.legs);
   const [oddsText, setOddsText] = useState("");
   const [limitMsg, setLimitMsg] = useState("");
   const [now] = useState(() => Date.now());
@@ -166,30 +177,60 @@ function PicksInner() {
     queryFn: fetchGames,
   });
   const upcoming = useMemo(() => upcomingWeek(all, now), [all, now]);
-  const activeGame = gameId || upcoming.rows[0]?.game_id || "";
-  const gameRow = useMemo(() => (all ?? []).find((g) => g.game_id === activeGame), [all, activeGame]);
+  const activeGame = browseId || upcoming.rows[0]?.game_id || "";
+  const rowOf = useMemo(() => {
+    const m = new Map((all ?? []).map((g) => [g.game_id, g]));
+    return (id: string) => m.get(id);
+  }, [all]);
 
-  const q = useQuery({
-    queryKey: ["parlay-inputs", activeGame],
-    queryFn: () => fetchInputs(gameRow, activeGame),
-    enabled: !!activeGame && (!!gameRow || !MOCK_ENABLED),
-    retry: false,
+  // Un fetch por cada partido del ticket mas el que se esta explorando (en paralelo y cacheados).
+  const ids = useMemo(() => {
+    const out: string[] = [];
+    for (const id of [activeGame, ...legs.map((l) => l.gameId)]) if (id && !out.includes(id)) out.push(id);
+    return out;
+  }, [activeGame, legs]);
+
+  const statuses = useQueries({
+    queries: ids.map((id) => ({
+      queryKey: ["parlay-inputs", id],
+      queryFn: () => fetchInputs(rowOf(id), id),
+      enabled: !MOCK_ENABLED || !loadingGames,
+      retry: false,
+      staleTime: 60_000,
+    })),
+    combine: (rs): GameStatus[] =>
+      rs.map((r, i) => ({
+        id: ids[i],
+        inputs: r.data?.data,
+        mock: r.data?.mock === true,
+        loading: r.isLoading || r.isPending,
+        failed: r.isError,
+      })),
   });
-  const inputs = q.data?.data;
-  const isMock = q.data?.mock === true;
+  const statusOf = (id: string) => statuses.find((s) => s.id === id);
+  const browse = statusOf(activeGame);
+  const inputs = browse?.inputs;
+  const anyMock = statuses.some((s) => s.mock && legs.some((l) => l.gameId === s.id || s.id === activeGame));
+
+  const inputsByGame = useMemo(() => {
+    const m: Record<string, ParlayInputs | undefined> = {};
+    for (const s of statuses) m[s.id] = s.inputs;
+    return m;
+  }, [statuses]);
 
   // URL compartible + localStorage
   useEffect(() => {
-    if (!activeGame) return;
-    const qs = new URLSearchParams({ game_id: activeGame });
-    if (legs.length > 0) qs.set("legs", legs.map(legKey).join(","));
+    if (!activeGame && legs.length === 0) return;
+    const qs = new URLSearchParams();
+    if (activeGame) qs.set("game_id", activeGame);
+    if (legs.length > 0) qs.set("legs", legs.map(ticketLegKey).join(","));
     try {
       window.history.replaceState(null, "", `${window.location.pathname}?${qs}`);
     } catch {
       // sin acceso a history
     }
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ game_id: activeGame, legs: legs.map(legKey) }));
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ game_id: activeGame, legs: legs.map(ticketLegKey) }));
     } catch {
       // modo privado / cuota llena
     }
@@ -197,33 +238,38 @@ function PicksInner() {
 
   const bookDecimal = parseOdds(oddsText);
   const result = useMemo(
-    () => (inputs && legs.length > 0 ? evaluateParlay(inputs, legs, { bookDecimal }) : null),
-    [inputs, legs, bookDecimal]
+    () => (legs.length > 0 ? evaluateTicket(inputsByGame, legs, { bookDecimal }) : null),
+    [inputsByGame, legs, bookDecimal]
   );
+  const failedGames = ids.filter((id) => legs.some((l) => l.gameId === id) && statusOf(id)?.failed);
+  const teamsOf = (id: string): Teams => {
+    const g = statusOf(id)?.inputs?.game ?? rowOf(id);
+    return g ? { home: g.home_team, away: g.away_team } : { home: "local", away: "visitante" };
+  };
+  const labelOf = (id: string) => {
+    const g = statusOf(id)?.inputs?.game ?? rowOf(id);
+    return g ? gameLabel(g) : id;
+  };
 
-  const addLeg = (l: Leg) => {
-    if (legs.some((x) => legKey(x) === legKey(l))) return;
-    if (legs.length >= MAX_LEGS) {
-      setLimitMsg(`Máximo ${MAX_LEGS} selecciones por parlay.`);
-      return;
-    }
-    setLimitMsg("");
-    setLegs([...legs, l]);
+  const addLeg = (leg: Leg, gameId = activeGame) => {
+    if (!gameId) return;
+    const r = addToTicket(legs, { gameId, leg });
+    setLimitMsg(r.error ?? "");
+    if (r.ticket !== legs) setLegs(r.ticket);
   };
-  const removeLeg = (k: string) => setLegs((cur) => cur.filter((x) => legKey(x) !== k));
-  const changeGame = (id: string) => {
-    setGameId(id);
-    setLegs([]);
-  };
+  const removeLeg = (k: string) => setLegs((cur) => cur.filter((x) => ticketLegKey(x) !== k));
 
   const gameOptions = upcoming.rows.slice();
   const gameInList = gameOptions.some((g) => g.game_id === activeGame);
+  const countIn = (id: string) => legs.filter((l) => l.gameId === id).length;
+  const browseLegs = new Set(legs.filter((l) => l.gameId === activeGame).map((l) => legKey(l.leg)));
+  const calibration = inputs?.calibration ?? statuses.find((s) => s.inputs?.calibration)?.inputs?.calibration ?? null;
 
   return (
     <div className="flex min-h-screen flex-col pb-[78px]">
       <div className="px-[22px] pt-[calc(env(safe-area-inset-top,0px)+22px)]">
         <div className="mb-[14px] flex items-baseline justify-between">
-          <h1 className="text-[16px] font-bold">Picks · Parlay del partido</h1>
+          <h1 className="text-[16px] font-bold">Picks · Ticket</h1>
           <span className="text-[11px] uppercase tracking-wide" style={{ color: "var(--text-3)" }}>
             {upcoming.week != null ? `Semana ${upcoming.week} · ${upcoming.season}` : "—"}
           </span>
@@ -234,28 +280,34 @@ function PicksInner() {
           style={{ color: "var(--text-2)", borderLeft: "2px solid var(--accent)" }}
         >
           Estimación del modelo, no es recomendación de apuesta.
-          {inputs?.calibration && (
+          {calibration && (
             <span className="tabular-nums">
-              {" "}Calibración: ECE {pct(inputs.calibration.ece)} sobre {inputs.calibration.n} predicciones.
+              {" "}Calibración: ECE {pct(calibration.ece)} sobre {calibration.n} predicciones.
             </span>
           )}
         </p>
 
         <div className="flex flex-col gap-1 pb-4">
-          <label htmlFor="pk-game" className={label} style={{ color: "var(--text-3)" }}>Partido</label>
+          <label htmlFor="pk-game" className={label} style={{ color: "var(--text-3)" }}>
+            Explorar partido (agrega selecciones al ticket)
+          </label>
           <select
             id="pk-game"
             className="min-h-[40px] rounded-lg px-2 text-[14px]"
             style={fieldStyle}
             value={activeGame}
-            onChange={(e) => changeGame(e.target.value)}
+            onChange={(e) => {
+              setBrowseId(e.target.value);
+              setLimitMsg("");
+            }}
             disabled={gameOptions.length === 0 && !activeGame}
           >
-            {!gameInList && activeGame && <option value={activeGame}>{activeGame}</option>}
+            {!gameInList && activeGame && <option value={activeGame}>{labelOf(activeGame)}</option>}
             {gameOptions.map((g) => (
               <option key={g.game_id} value={g.game_id}>
-                {g.away_team} @ {g.home_team} ·{" "}
+                {gameLabel(g)} ·{" "}
                 {new Date(g.kickoff_utc).toLocaleString("es-MX", { weekday: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                {countIn(g.game_id) > 0 ? ` · ${countIn(g.game_id)} en ticket` : ""}
               </option>
             ))}
           </select>
@@ -267,44 +319,45 @@ function PicksInner() {
         {gamesError && (
           <p className="text-[13px]" style={{ color: "var(--side-b)" }}>No se pudieron cargar los partidos. Intenta de nuevo.</p>
         )}
-        {!loadingGames && !gamesError && !activeGame && (
+        {!loadingGames && !gamesError && !activeGame && legs.length === 0 && (
           <p className="text-[13px]" style={{ color: "var(--text-2)" }}>
             Aún no hay partidos próximos; se publican cuando corre el ciclo semanal.
           </p>
         )}
-        {activeGame && q.isLoading && <p className="text-[13px]" style={{ color: "var(--text-2)" }}>Cargando datos de picks…</p>}
-        {q.error instanceof NotAvailable && (
-          <p className="text-[13px]" style={{ color: "var(--text-2)" }}>Datos de picks no disponibles aún</p>
-        )}
-        {q.isError && !(q.error instanceof NotAvailable) && (
-          <p className="text-[13px]" style={{ color: "var(--side-b)" }}>No se pudieron cargar los datos de picks. Intenta de nuevo.</p>
+        {activeGame && browse?.loading && <p className="text-[13px]" style={{ color: "var(--text-2)" }}>Cargando datos de picks…</p>}
+        {activeGame && browse?.failed && (
+          <p className="mb-4 text-[13px]" style={{ color: "var(--text-2)" }}>
+            Datos de picks no disponibles para {labelOf(activeGame)}.
+          </p>
         )}
 
-        {isMock && (
+        {anyMock && (
           <p className="mb-4 text-[12px] font-semibold" style={{ color: "var(--accent)" }}>
             DATOS DE EJEMPLO (mock de desarrollo): no son proyecciones reales.
           </p>
         )}
 
-        {inputs && (
-          <>
-            {limitMsg && (
-              <p className="mb-3 text-[12px] font-semibold" role="status" style={{ color: "var(--side-b)" }}>{limitMsg}</p>
-            )}
-            <Builder inputs={inputs} onAdd={addLeg} />
-            <ParlayCard
-              inputs={inputs}
-              legs={legs}
-              result={result}
-              oddsText={oddsText}
-              onOdds={setOddsText}
-              bookDecimal={bookDecimal}
-              onRemove={removeLeg}
-              onClear={() => setLegs([])}
-            />
-            <Scorers inputs={inputs} legs={legs} onAdd={addLeg} />
-          </>
+        {limitMsg && (
+          <p className="mb-3 text-[12px] font-semibold" role="status" style={{ color: "var(--side-b)" }}>{limitMsg}</p>
         )}
+
+        {inputs && <Builder key={activeGame} inputs={inputs} inTicket={browseLegs} onAdd={(l) => addLeg(l)} />}
+
+        <TicketCard
+          legs={legs}
+          result={result}
+          statusOf={statusOf}
+          labelOf={labelOf}
+          teamsOf={teamsOf}
+          failedGames={failedGames}
+          oddsText={oddsText}
+          onOdds={setOddsText}
+          bookDecimal={bookDecimal}
+          onRemove={removeLeg}
+          onClear={() => setLegs([])}
+        />
+
+        {inputs && <Scorers inputs={inputs} legs={browseLegs} onAdd={(l) => addLeg(l)} />}
       </div>
       <BottomNav active="picks" />
     </div>
@@ -313,8 +366,16 @@ function PicksInner() {
 
 // ------------------------------------------------------------ constructor
 
-function Builder({ inputs, onAdd }: { inputs: ParlayInputs; onAdd: (l: Leg) => void }) {
+function Builder({ inputs, inTicket, onAdd }: { inputs: ParlayInputs; inTicket: Set<string>; onAdd: (l: Leg) => void }) {
   const g = inputs.game;
+  const quick: { leg: Leg; text: string }[] = [
+    { leg: { kind: "winner", team: "away" }, text: `Gana ${g.away_team}` },
+    { leg: { kind: "winner", team: "home" }, text: `Gana ${g.home_team}` },
+    { leg: { kind: "spread", team: "away", line: halfLine(g.margin_mu) }, text: `${g.away_team} ${fmtLine(halfLine(g.margin_mu))}` },
+    { leg: { kind: "spread", team: "home", line: halfLine(-g.margin_mu) }, text: `${g.home_team} ${fmtLine(halfLine(-g.margin_mu))}` },
+    { leg: { kind: "total", side: "over", line: halfLine(g.total_mu) }, text: `Más de ${halfLine(g.total_mu)}` },
+    { leg: { kind: "total", side: "under", line: halfLine(g.total_mu) }, text: `Menos de ${halfLine(g.total_mu)}` },
+  ];
   const [mode, setMode] = useState<"player" | "game">("player");
   const [playerSel, setPlayerSel] = useState("");
   const [marketSel, setMarketSel] = useState("");
@@ -375,7 +436,27 @@ function Builder({ inputs, onAdd }: { inputs: ParlayInputs; onAdd: (l: Leg) => v
 
   return (
     <section className="mb-6" aria-labelledby="pk-builder">
-      <h2 id="pk-builder" className="mb-2 text-[14px] font-bold">Agregar selección</h2>
+      <h2 id="pk-builder" className="mb-2 text-[14px] font-bold">
+        {gameLabel(g)} · agregar selección
+      </h2>
+      <div className="mb-4 grid grid-cols-2 gap-[6px] sm:grid-cols-3" role="group" aria-label={`Selecciones rápidas ${gameLabel(g)}`}>
+        {quick.map(({ leg, text }) => {
+          const has = inTicket.has(legKey(leg));
+          return (
+            <button
+              key={legKey(leg)}
+              type="button"
+              className={`${btn} tabular-nums`}
+              style={{ background: "var(--surface)", color: has ? "var(--text-3)" : "var(--accent)", border: "1px solid var(--hair)" }}
+              disabled={has}
+              onClick={() => onAdd(leg)}
+              aria-label={`Agregar al ticket: ${gameLabel(g)}, ${text}`}
+            >
+              {text}
+            </button>
+          );
+        })}
+      </div>
       <div className="mb-3 flex gap-[6px]" role="group" aria-label="Tipo de selección">
         <button type="button" className={btn} style={seg(mode === "player")} aria-pressed={mode === "player"} onClick={() => setMode("player")}>
           Jugador
@@ -486,7 +567,7 @@ function Builder({ inputs, onAdd }: { inputs: ParlayInputs; onAdd: (l: Leg) => v
           disabled={!candidate || !candP?.available}
           onClick={() => candidate && onAdd(candidate)}
         >
-          Agregar al parlay
+          Agregar al ticket
         </button>
       </div>
     </section>
@@ -502,34 +583,43 @@ function Field({ id, text, children }: { id: string; text: string; children: Rea
   );
 }
 
-// ------------------------------------------------------------ parlay
+// ------------------------------------------------------------ ticket
 
-function ParlayCard({
-  inputs,
+function TicketCard({
   legs,
   result,
+  statusOf,
+  labelOf,
+  teamsOf,
+  failedGames,
   oddsText,
   onOdds,
   bookDecimal,
   onRemove,
   onClear,
 }: {
-  inputs: ParlayInputs;
-  legs: Leg[];
-  result: ReturnType<typeof evaluateParlay> | null;
+  legs: TicketLeg[];
+  result: TicketResult | null;
+  statusOf: (id: string) => GameStatus | undefined;
+  labelOf: (id: string) => string;
+  teamsOf: (id: string) => Teams;
+  failedGames: string[];
   oddsText: string;
   onOdds: (s: string) => void;
   bookDecimal: number | null;
   onRemove: (k: string) => void;
   onClear: () => void;
 }) {
-  const unavailable = result?.legs.filter((l) => !l.available).length ?? 0;
+  const unavailable = result?.unavailableLegs ?? 0;
   return (
     <section className="mb-6" aria-labelledby="pk-parlay">
       <div className="flex items-baseline justify-between" style={{ borderBottom: "1px solid var(--hair)" }}>
-        <h2 id="pk-parlay" className="py-2 text-[14px] font-bold">Parlay ({legs.length})</h2>
+        <h2 id="pk-parlay" className="py-2 text-[14px] font-bold">
+          Ticket ({legs.length} {legs.length === 1 ? "selección" : "selecciones"}
+          {result && result.games.length > 0 ? ` · ${result.games.length} ${result.games.length === 1 ? "partido" : "partidos"}` : ""})
+        </h2>
         {legs.length > 0 && (
-          <button type="button" onClick={onClear} className="text-[12px] font-medium underline underline-offset-2" style={{ color: "var(--text-2)" }}>
+          <button type="button" onClick={onClear} className="min-h-[40px] text-[12px] font-medium underline underline-offset-2" style={{ color: "var(--text-2)" }}>
             Vaciar
           </button>
         )}
@@ -537,48 +627,78 @@ function ParlayCard({
 
       {legs.length === 0 || !result ? (
         <p className="pt-3 text-[13px]" style={{ color: "var(--text-2)" }}>
-          Agrega selecciones arriba o con el botón + de la lista de abajo.
+          Elige un partido arriba y agrega selecciones; puedes combinar hasta {MAX_GAMES} partidos y {MAX_LEGS} selecciones en el mismo ticket.
         </p>
       ) : (
         <>
-          <ul>
-            {result.legs.map((r) => (
-              <li key={legKey(r.leg)} className="flex items-center gap-3 py-[10px]" style={{ borderBottom: "1px solid var(--hair-soft)" }}>
-                <span className="min-w-0 flex-1 text-[13.5px]">
-                  {describeLeg(r.leg, inputs)}
-                  {r.approx && r.available && (
-                    <span className="ml-2 text-[11px]" style={{ color: "var(--text-3)" }}>aproximado</span>
+          {result.games.map((gr) => {
+            const st = statusOf(gr.gameId);
+            const teams = teamsOf(gr.gameId);
+            const headId = `pk-g-${gr.gameId}`;
+            return (
+              <div key={gr.gameId} role="group" aria-labelledby={headId} className="pt-3">
+                <div className="flex items-baseline justify-between gap-3">
+                  <h3 id={headId} className="text-[12px] font-bold uppercase tracking-wider" style={{ color: "var(--text-2)" }}>
+                    {labelOf(gr.gameId)}
+                  </h3>
+                  {gr.joint != null && gr.legs.filter((l) => l.available).length >= 2 && (
+                    <span className="text-[12px] tabular-nums" style={{ color: "var(--text-2)" }}>
+                      Conjunta del partido <span className="font-bold" style={{ color: "var(--text)" }}>{pct(gr.joint)}</span>
+                    </span>
                   )}
-                </span>
-                <span className="text-[14px] font-bold tabular-nums">
-                  {r.available ? pct(r.p) : <span style={{ color: "var(--text-3)" }}>—</span>}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => onRemove(legKey(r.leg))}
-                  aria-label={`Quitar ${describeLeg(r.leg, inputs)}`}
-                  className="min-h-[40px] min-w-[40px] text-[18px] leading-none"
-                  style={{ color: "var(--text-3)" }}
-                >
-                  ×
-                </button>
-              </li>
-            ))}
-          </ul>
+                </div>
+                <ul>
+                  {gr.legs.map((r) => (
+                    <li key={r.key} className="flex items-center gap-3 py-[10px]" style={{ borderBottom: "1px solid var(--hair-soft)" }}>
+                      <span className="min-w-0 flex-1 text-[13.5px]">
+                        {describeLeg(r.leg, st?.inputs, teams)}
+                        {r.approx && r.available && (
+                          <span className="ml-2 text-[11px]" style={{ color: "var(--text-3)" }}>aproximado</span>
+                        )}
+                      </span>
+                      <span className="text-[14px] font-bold tabular-nums">
+                        {r.available ? (
+                          pct(r.p)
+                        ) : (
+                          <span className="text-[12px] font-medium" style={{ color: "var(--text-3)" }}>
+                            {st?.loading ? "cargando…" : "no disponible"}
+                          </span>
+                        )}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onRemove(r.key)}
+                        aria-label={`Quitar ${labelOf(gr.gameId)}: ${describeLeg(r.leg, st?.inputs, teams)}`}
+                        className="min-h-[40px] min-w-[40px] text-[18px] leading-none"
+                        style={{ color: "var(--text-3)" }}
+                      >
+                        ×
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            );
+          })}
 
-          {unavailable > 0 && (
+          {failedGames.length > 0 && (
+            <p className="pt-2 text-[12px]" role="status" style={{ color: "var(--side-b)" }}>
+              Sin datos del modelo para {failedGames.map(labelOf).join(", ")}: sus selecciones no se cuentan en el ticket.
+            </p>
+          )}
+          {unavailable > 0 && failedGames.length === 0 && (
             <p className="pt-2 text-[12px]" style={{ color: "var(--side-b)" }}>
-              {unavailable} {unavailable === 1 ? "selección sin datos y no se cuenta" : "selecciones sin datos y no se cuentan"} en el parlay.
+              {unavailable} {unavailable === 1 ? "selección sin datos y no se cuenta" : "selecciones sin datos y no se cuentan"} en el ticket.
             </p>
           )}
 
           <div className="grid grid-cols-2 gap-4 py-4" aria-live="polite">
             <div>
-              <div className={label} style={{ color: "var(--text-3)" }}>Conjunta (con correlación)</div>
+              <div className={label} style={{ color: "var(--text-3)" }}>Ticket (correlación por partido)</div>
               <div className="text-[28px] font-bold tabular-nums">{pct(result.joint)}</div>
             </div>
             <div>
-              <div className={label} style={{ color: "var(--text-3)" }}>Si fueran independientes</div>
+              <div className={label} style={{ color: "var(--text-3)" }}>Si todo fuera independiente</div>
               <div className="text-[28px] font-bold tabular-nums" style={{ color: "var(--text-2)" }}>{pct(result.independent)}</div>
             </div>
             <div>
@@ -621,6 +741,7 @@ function ParlayCard({
             {result.repairShrink > 0 && (
               <li>La matriz de correlación no era válida y se corrigió (suavizada {pct(result.repairShrink, 0)} hacia independencia).</li>
             )}
+            <li>Partidos distintos se tratan como independientes entre sí; la correlación solo aplica dentro de cada partido.</li>
             <li>Simulación Monte Carlo de {result.sims.toLocaleString("es-MX")} escenarios con cópula gaussiana.</li>
           </ul>
         </>
@@ -631,7 +752,7 @@ function ParlayCard({
 
 // ------------------------------------------------------------ quien anotaria
 
-function Scorers({ inputs, legs, onAdd }: { inputs: ParlayInputs; legs: Leg[]; onAdd: (l: Leg) => void }) {
+function Scorers({ inputs, legs, onAdd }: { inputs: ParlayInputs; legs: Set<string>; onAdd: (l: Leg) => void }) {
   const rows = useMemo(
     () =>
       inputs.players
@@ -640,11 +761,11 @@ function Scorers({ inputs, legs, onAdd }: { inputs: ParlayInputs; legs: Leg[]; o
         .sort((a, b) => b.any - a.any),
     [inputs]
   );
-  const inParlay = new Set(legs.map(legKey));
+  const inParlay = legs;
   return (
     <section className="mb-4" aria-labelledby="pk-scorers">
       <h2 id="pk-scorers" className="py-2 text-[14px] font-bold" style={{ borderBottom: "1px solid var(--hair)" }}>
-        ¿Quién anotaría?
+        ¿Quién anotaría? · {gameLabel(inputs.game)}
       </h2>
       {rows.length === 0 ? (
         <p className="pt-3 text-[13px]" style={{ color: "var(--text-2)" }}>Sin proyecciones de TD para este partido.</p>
@@ -676,7 +797,7 @@ function Scorers({ inputs, legs, onAdd }: { inputs: ParlayInputs; legs: Leg[]; o
                         type="button"
                         disabled={inParlay.has(aKey)}
                         onClick={() => onAdd({ kind: "anytime_td", gsis_id: p.gsis_id })}
-                        aria-label={`Agregar al parlay: ${p.player_name} anota TD`}
+                        aria-label={`Agregar al ticket: ${p.player_name} anota TD`}
                         className="min-h-[40px] min-w-[44px] text-[12.5px] font-semibold disabled:opacity-40"
                         style={{ color: "var(--accent)" }}
                       >
@@ -686,7 +807,7 @@ function Scorers({ inputs, legs, onAdd }: { inputs: ParlayInputs; legs: Leg[]; o
                         type="button"
                         disabled={first == null || inParlay.has(fKey)}
                         onClick={() => onAdd({ kind: "first_td", gsis_id: p.gsis_id })}
-                        aria-label={`Agregar al parlay: ${p.player_name} primer TD`}
+                        aria-label={`Agregar al ticket: ${p.player_name} primer TD`}
                         className="min-h-[40px] min-w-[44px] text-[12.5px] font-semibold disabled:opacity-40"
                         style={{ color: "var(--accent)" }}
                       >

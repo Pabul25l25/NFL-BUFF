@@ -102,10 +102,17 @@ def test_props_predictions_team_wins_over_features_fallback(db: Database) -> Non
 
 def test_parlay_queries_pick_latest_per_game(db: Database) -> None:
     t0, t1 = datetime(2099, 1, 1), datetime(2099, 1, 2)
-    for tbl in ("parlay_game_corr", "parlay_game_legs", "parlay_calibration"):
-        if not db.table_exists(tbl):  # 009 puede no estar aplicada aún en esta rama
-            import pytest
-            pytest.skip("migración 009 (tablas parlay_*) todavía no existe")
+    # Mismo esquema que la migración 009; IF NOT EXISTS para no depender de su orden.
+    db.execute_script("""
+        CREATE TABLE IF NOT EXISTS parlay_game_corr (
+            game_id VARCHAR, model_id VARCHAR, legs VARCHAR, matrix VARCHAR, as_of_ts TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS parlay_game_legs (
+            game_id VARCHAR, model_id VARCHAR, p_home_win DOUBLE, margin_mu DOUBLE,
+            margin_sigma DOUBLE, total_mu DOUBLE, total_sigma DOUBLE, as_of_ts TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS parlay_calibration (
+            model_id VARCHAR, ece DOUBLE, logloss DOUBLE, ece_independent DOUBLE,
+            logloss_independent DOUBLE, n INTEGER, created_at TIMESTAMP);
+    """)
     db.write_df(pd.DataFrame([
         {"game_id": GAME, "model_id": "old", "legs": "[]", "matrix": "[]", "as_of_ts": t0},
         {"game_id": GAME, "model_id": "new", "legs": '["a"]', "matrix": "[[1.0]]", "as_of_ts": t1},

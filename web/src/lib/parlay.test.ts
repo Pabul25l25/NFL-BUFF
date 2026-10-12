@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   ParlayInputs,
   choleskyRaw,
+  MAX_GAMES,
+  addToTicket,
   choleskyRepair,
+  decodeTicket,
+  evaluateTicket,
+  ticketLegKey,
   decodeAdd,
   decodeLeg,
   evaluateParlay,
@@ -125,6 +130,75 @@ describe("evaluateParlay", () => {
     expect(r.approx).toBe(true);
     expect(r.legs[0].p).toBeGreaterThan(0);
     expect(r.legs[1].available).toBe(false);
+  });
+});
+
+describe("ticket multi-partido", () => {
+  const g2 = (): ParlayInputs => {
+    const i = inputs(0.7);
+    i.game = { ...i.game, game_id: "g2", home_team: "BAL", away_team: "BUF", p_home_win: 0.4, margin_mu: -2 };
+    return i;
+  };
+  const by = (): Record<string, ParlayInputs> => ({ g1: inputs(0.7), g2: g2() });
+  const win = (team: "home" | "away") => ({ kind: "winner" as const, team });
+
+  it("dos partidos con una leg cada uno: producto de marginales", () => {
+    const r = evaluateTicket(by(), [
+      { gameId: "g1", leg: win("home") },
+      { gameId: "g2", leg: win("away") },
+    ]);
+    const p1 = r.games[0].legs[0].p;
+    const p2 = r.games[1].legs[0].p;
+    expect(r.joint).toBeCloseTo(p1 * p2, 12);
+    expect(r.independent).toBeCloseTo(p1 * p2, 12);
+    expect(Math.abs(p1 - normCdf(3 / 13))).toBeLessThan(0.012);
+  });
+
+  it("partido correlacionado x otro partido = conjunta por partido x la otra", () => {
+    const r = evaluateTicket(by(), [
+      { gameId: "g1", leg: over("A", 100) },
+      { gameId: "g1", leg: over("B", 100) },
+      { gameId: "g2", leg: win("home") },
+    ]);
+    const j1 = evaluateParlay(inputs(0.7), [over("A", 100), over("B", 100)]).joint;
+    const j2 = evaluateParlay(g2(), [win("home")]).joint;
+    expect(r.joint).toBeCloseTo(j1 * j2, 12);
+    expect(r.games[0].joint).toBeCloseTo(j1, 12);
+    expect(r.joint).toBeGreaterThan(r.independent);
+  });
+
+  it("un partido sin datos queda fuera y se cuenta como no disponible", () => {
+    const r = evaluateTicket({ g1: inputs() }, [
+      { gameId: "g1", leg: win("home") },
+      { gameId: "gX", leg: win("home") },
+    ]);
+    expect(r.unavailableLegs).toBe(1);
+    expect(r.games[1].legs[0].reason).toBe("no disponible");
+    expect(r.joint).toBeCloseTo(r.games[0].legs[0].p, 12);
+  });
+
+  it("decodifica el formato nuevo y los antiguos", () => {
+    const l = over("A", 57.5);
+    const nuevo = decodeTicket({ legs: ["g1~w:home", `g2~${legKey(l)}`] });
+    expect(nuevo.map(ticketLegKey)).toEqual(["g1~w:home", `g2~${legKey(l)}`]);
+    const viejo = decodeTicket({ gameId: "g9", legs: ["w:away", "t:over:47.5"] });
+    expect(viejo).toHaveLength(2);
+    expect(viejo.every((x) => x.gameId === "g9")).toBe(true);
+    const add = decodeTicket({ gameId: "g9", add: ["A:receiving_yards:over:57.5", "B:anytime_td"] });
+    expect(add).toEqual([
+      { gameId: "g9", leg: l },
+      { gameId: "g9", leg: { kind: "anytime_td", gsis_id: "B" } },
+    ]);
+    expect(decodeTicket({ legs: ["w:home"] })).toEqual([]);
+  });
+
+  it("respeta limites de partidos y lineas", () => {
+    let t: ReturnType<typeof decodeTicket> = [];
+    for (let i = 0; i < MAX_GAMES; i++) t = addToTicket(t, { gameId: `g${i}`, leg: win("home") }).ticket;
+    const r = addToTicket(t, { gameId: "extra", leg: win("home") });
+    expect(r.ticket).toHaveLength(MAX_GAMES);
+    expect(r.error).toBeTruthy();
+    expect(addToTicket([], { gameId: "g", leg: { kind: "total", side: "over", line: 5000 } }).ticket).toHaveLength(0);
   });
 });
 
