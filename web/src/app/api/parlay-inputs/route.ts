@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSql } from "@/lib/db";
+import { GAME_ID_RE } from "@/lib/parlay";
 
-const GAME_ID_RE = /^\d{4}_\d{2}_[A-Z]{2,3}_[A-Z]{2,3}$/;
 
 /** Las columnas JSON se publican como VARCHAR; el driver puede devolverlas ya parseadas. */
 function parseJson<T>(value: unknown): T | null {

@@ -242,6 +242,9 @@ export function parseOdds(text: string): number | null {
 
 // ---------------------------------------------------------------- legs
 
+export const GAME_ID_RE = /^\d{4}_\d{2}_[A-Z]{2,3}_[A-Z]{2,3}$/;
+export const GSIS_ID_RE = /^[\w-]{1,20}$/;
+
 export type Side = "over" | "under";
 export type TeamSide = "home" | "away";
 
@@ -286,13 +289,13 @@ export function decodeLeg(s: string): Leg | null {
   switch (parts[0]) {
     case "p": {
       const line = num(parts[4]);
-      if (parts.length !== 5 || !parts[1] || !parts[2] || !isSide(parts[3]) || line == null) return null;
+      if (parts.length !== 5 || !GSIS_ID_RE.test(parts[1] ?? "") || !parts[2] || !isSide(parts[3]) || line == null) return null;
       return { kind: "player", gsis_id: parts[1], target: parts[2], side: parts[3], line };
     }
     case "atd":
     case "2td":
     case "ftd": {
-      if (parts.length !== 2 || !parts[1]) return null;
+      if (parts.length !== 2 || !GSIS_ID_RE.test(parts[1])) return null;
       const kind = parts[0] === "atd" ? "anytime_td" : parts[0] === "2td" ? "two_td" : "first_td";
       return { kind, gsis_id: parts[1] };
     }
@@ -316,7 +319,7 @@ export function decodeLeg(s: string): Leg | null {
 /** Parte `<gsis_id>:<target>:over:<line>` (enlace desde Props). target puede ser anytime_td, two_td, first_td. */
 export function decodeAdd(s: string): Leg | null {
   const [id, target, side, line] = s.split(":");
-  if (!id || !target) return null;
+  if (!id || !GSIS_ID_RE.test(id) || !target) return null;
   if (target === "anytime_td") return { kind: "anytime_td", gsis_id: id };
   if (target === "two_td") return { kind: "two_td", gsis_id: id };
   if (target === "first_td") return { kind: "first_td", gsis_id: id };
@@ -460,12 +463,79 @@ export interface EvalOptions {
   bookDecimal?: number | null;
 }
 
-type Pred = (i: number) => boolean;
+export const DEFAULT_SEED = 20240907;
+export const DEFAULT_SIMS = 20000;
 
-export function evaluateParlay(inputs: ParlayInputs, legs: Leg[], opts: EvalOptions = {}): ParlayResult {
-  const sims = opts.sims ?? 20000;
-  const seed = opts.seed ?? 20240907;
+/** Hash FNV-1a de 32 bits (para derivar semillas por partido). */
+export function hashString(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
 
+/** Semilla propia de cada partido: asi los partidos del ticket no comparten flujo aleatorio. */
+export const gameSeed = (seed: number, gameId: string) => (seed ^ hashString(gameId)) >>> 0;
+
+/** Vector de aciertos (1/0) de una leg dado el valor simulado de su estadistica subyacente. */
+export function hitVector(leg: Leg, stat: Float64Array): Uint8Array {
+  const n = stat.length;
+  const out = new Uint8Array(n);
+  switch (leg.kind) {
+    case "player":
+    case "total": {
+      const line = leg.line;
+      if (leg.side === "over") for (let s = 0; s < n; s++) out[s] = stat[s] > line ? 1 : 0;
+      else for (let s = 0; s < n; s++) out[s] = stat[s] < line ? 1 : 0;
+      break;
+    }
+    case "anytime_td":
+      for (let s = 0; s < n; s++) out[s] = stat[s] >= 1 ? 1 : 0;
+      break;
+    case "two_td":
+      for (let s = 0; s < n; s++) out[s] = stat[s] >= 2 ? 1 : 0;
+      break;
+    case "winner":
+      if (leg.team === "home") for (let s = 0; s < n; s++) out[s] = stat[s] > 0 ? 1 : 0;
+      else for (let s = 0; s < n; s++) out[s] = stat[s] < 0 ? 1 : 0;
+      break;
+    case "spread": {
+      const line = leg.line;
+      if (leg.team === "home") for (let s = 0; s < n; s++) out[s] = stat[s] + line > 0 ? 1 : 0;
+      else for (let s = 0; s < n; s++) out[s] = -stat[s] + line > 0 ? 1 : 0;
+      break;
+    }
+    case "first_td":
+      break;
+  }
+  return out;
+}
+
+/** Simulacion de un partido: aciertos y estadistica por simulacion de cada leg. */
+export interface GameSim {
+  sims: number;
+  seed: number;
+  legs: Leg[];
+  results: LegResult[];
+  /** matriz de aciertos [leg][sim]; null si la leg no esta disponible */
+  hits: (Uint8Array | null)[];
+  /** valor simulado de la estadistica subyacente de cada leg; null si no aplica */
+  stats: (Float64Array | null)[];
+  /** todas las legs disponibles aciertan en la simulacion (primer TD como Bernoulli independiente) */
+  hit: Uint8Array;
+  nActive: number;
+  /** producto de las marginales analiticas de primer TD */
+  ftdProduct: number;
+  /** conjunta (Monte Carlo de las legs simuladas x producto analitico de primer TD) */
+  joint: number;
+  independent: number;
+  approx: boolean;
+  repairShrink: number;
+}
+
+function simulateGameRaw(inputs: ParlayInputs, legs: Leg[], sims: number, seed: number): GameSim {
   // 1) latentes necesarias (en orden estable)
   const perLeg = legs.map((l) => legLatents(inputs, l));
   const keys: string[] = [];
@@ -504,90 +574,162 @@ export function evaluateParlay(inputs: ParlayInputs, legs: Leg[], opts: EvalOpti
   }
   const col = (key: string) => values[keys.indexOf(key)];
 
-  // 4) predicados por leg
-  const preds: (Pred | null)[] = legs.map((leg, i) => {
+  // 4) estadistica subyacente y aciertos por leg
+  const stats: (Float64Array | null)[] = legs.map((leg, i) => {
     const ks = perLeg[i];
     if (!ks) return null;
     switch (leg.kind) {
-      case "player": {
-        const v = col(ks[0]);
-        return leg.side === "over" ? (s) => v[s] > leg.line : (s) => v[s] < leg.line;
-      }
+      case "player":
+        return col(ks[0]);
       case "anytime_td":
       case "two_td": {
-        const need = leg.kind === "anytime_td" ? 1 : 2;
-        const vs = ks.map(col);
-        return (s) => {
-          let t = 0;
-          for (const v of vs) t += v[s];
-          return t >= need;
-        };
+        if (ks.length === 1) return col(ks[0]);
+        const sum = new Float64Array(sims);
+        for (const key of ks) {
+          const v = col(key);
+          for (let s = 0; s < sims; s++) sum[s] += v[s];
+        }
+        return sum;
       }
       case "first_td":
         return null;
-      case "winner": {
-        const v = col("g:margin");
-        return leg.team === "home" ? (s) => v[s] > 0 : (s) => v[s] < 0;
-      }
-      case "spread": {
-        const v = col("g:margin");
-        return leg.team === "home" ? (s) => v[s] + leg.line > 0 : (s) => -v[s] + leg.line > 0;
-      }
-      case "total": {
-        const v = col("g:total");
-        return leg.side === "over" ? (s) => v[s] > leg.line : (s) => v[s] < leg.line;
-      }
+      case "winner":
+      case "spread":
+        return col("g:margin");
+      case "total":
+        return col("g:total");
     }
   });
 
-  // 5) marginales y conjunta
-  const results: LegResult[] = legs.map((leg, i) => {
+  const results: LegResult[] = [];
+  const hits: (Uint8Array | null)[] = [];
+  legs.forEach((leg, i) => {
     if (leg.kind === "first_td") {
       const p = firstTdProb(inputs, leg.gsis_id);
-      return p == null
-        ? { leg, available: false, reason: "Sin proyección de TD para este jugador", p: 0, approx: true }
-        : { leg, available: true, p, approx: true };
+      if (p == null) {
+        results.push({ leg, available: false, reason: "Sin proyección de TD para este jugador", p: 0, approx: true });
+        hits.push(null);
+        return;
+      }
+      // Bernoulli independiente con semilla propia: solo sirve para escenarios.
+      const r = mulberry32((seed ^ hashString(`ftd:${leg.gsis_id}`)) >>> 0);
+      const v = new Uint8Array(sims);
+      for (let s = 0; s < sims; s++) v[s] = r() < p ? 1 : 0;
+      results.push({ leg, available: true, p, approx: true });
+      hits.push(v);
+      return;
     }
-    const pr = preds[i];
-    if (!pr) return { leg, available: false, reason: "Sin datos del modelo para esta selección", p: 0, approx: false };
-    let hit = 0;
-    for (let s = 0; s < sims; s++) if (pr(s)) hit++;
-    return { leg, available: true, p: hit / sims, approx: false };
+    const st = stats[i];
+    if (!st) {
+      results.push({ leg, available: false, reason: "Sin datos del modelo para esta selección", p: 0, approx: false });
+      hits.push(null);
+      return;
+    }
+    const v = hitVector(leg, st);
+    let c = 0;
+    for (let s = 0; s < sims; s++) c += v[s];
+    results.push({ leg, available: true, p: c / sims, approx: false });
+    hits.push(v);
   });
 
-  const active = results.filter((r) => r.available);
-  const mcPreds = results.flatMap((r, i) => (r.available && r.leg.kind !== "first_td" ? [preds[i] as Pred] : []));
-  let hits = 0;
-  if (mcPreds.length > 0) {
+  // 5) conjunta
+  const hit = new Uint8Array(sims);
+  const mcIdx: number[] = [];
+  const allIdx: number[] = [];
+  const ftdIdx: number[] = [];
+  results.forEach((r, i) => {
+    if (!r.available) return;
+    allIdx.push(i);
+    if (r.leg.kind === "first_td") ftdIdx.push(i);
+    else mcIdx.push(i);
+  });
+  let mcHits = 0;
+  if (allIdx.length > 0) {
     for (let s = 0; s < sims; s++) {
-      let ok = true;
-      for (const pr of mcPreds) {
-        if (!pr(s)) {
-          ok = false;
+      let okMc = true;
+      for (const i of mcIdx) {
+        if (!(hits[i] as Uint8Array)[s]) {
+          okMc = false;
           break;
         }
       }
-      if (ok) hits++;
+      if (okMc) mcHits++;
+      let ok = okMc;
+      if (ok) {
+        for (const i of ftdIdx) {
+          if (!(hits[i] as Uint8Array)[s]) {
+            ok = false;
+            break;
+          }
+        }
+      }
+      hit[s] = ok ? 1 : 0;
     }
   }
-  const mcJoint = mcPreds.length > 0 ? hits / sims : 1;
-  const ftdProduct = active.filter((r) => r.leg.kind === "first_td").reduce((a, r) => a * r.p, 1);
-  const joint = active.length === 0 ? 0 : mcJoint * ftdProduct;
-  const independent = active.length === 0 ? 0 : active.reduce((a, r) => a * r.p, 1);
-
-  const bookDecimal = opts.bookDecimal ?? null;
+  const mcJoint = mcIdx.length > 0 ? mcHits / sims : 1;
+  const ftdProduct = ftdIdx.reduce((a, i) => a * results[i].p, 1);
   return {
-    legs: results,
-    joint,
-    independent,
-    fairDecimal: active.length === 0 ? null : fairDecimal(joint),
-    fairAmerican: active.length === 0 ? null : toAmerican(joint),
+    sims,
+    seed,
+    legs,
+    results,
+    hits,
+    stats,
+    hit,
+    nActive: allIdx.length,
+    ftdProduct,
+    joint: allIdx.length === 0 ? 0 : mcJoint * ftdProduct,
+    independent: allIdx.length === 0 ? 0 : allIdx.reduce((a, i) => a * results[i].p, 1),
     approx: results.some((r) => r.available && r.approx),
     repairShrink: shrink,
-    sims,
-    ev: bookDecimal != null && active.length > 0 ? joint * bookDecimal - 1 : null,
+  };
+}
+
+const simCache = new WeakMap<ParlayInputs, Map<string, GameSim>>();
+const SIM_CACHE_MAX = 16;
+
+/** Simulacion memoizada por (datos del partido, legs, sims, semilla). Los datos de entrada no deben mutarse. */
+export function simulateGame(inputs: ParlayInputs, legs: Leg[], opts: { sims?: number; seed?: number } = {}): GameSim {
+  const sims = opts.sims ?? DEFAULT_SIMS;
+  const seed = opts.seed ?? DEFAULT_SEED;
+  const key = `${sims}|${seed}|${legs.map(legKey).join(",")}`;
+  let m = simCache.get(inputs);
+  if (!m) {
+    m = new Map();
+    simCache.set(inputs, m);
+  }
+  const cached = m.get(key);
+  if (cached) return cached;
+  const gs = simulateGameRaw(inputs, legs, sims, seed);
+  if (m.size >= SIM_CACHE_MAX) {
+    const oldest = m.keys().next().value;
+    if (oldest !== undefined) m.delete(oldest);
+  }
+  m.set(key, gs);
+  return gs;
+}
+
+export function evaluateParlay(inputs: ParlayInputs, legs: Leg[], opts: EvalOptions = {}): ParlayResult {
+  const g = simulateGame(inputs, legs, opts);
+  const bookDecimal = opts.bookDecimal ?? null;
+  const any = g.nActive > 0;
+  return {
+    legs: g.results,
+    joint: g.joint,
+    independent: g.independent,
+    fairDecimal: any ? fairDecimal(g.joint) : null,
+    fairAmerican: any ? toAmerican(g.joint) : null,
+    approx: g.approx,
+    repairShrink: g.repairShrink,
+    sims: g.sims,
+    ev: bookDecimal != null && any ? g.joint * bookDecimal - 1 : null,
     bookDecimal,
   };
+}
+
+/** Claves latentes que necesita una leg (null si no hay datos; [] para primer TD). */
+export function legLatentKeys(inputs: ParlayInputs, leg: Leg): string[] | null {
+  return legLatents(inputs, leg);
 }
 
 // ---------------------------------------------------------------- ticket multi-partido
@@ -609,7 +751,7 @@ export function decodeTicketLeg(s: string, defaultGameId = ""): TicketLeg | null
   const i = s.indexOf("~");
   const gameId = i >= 0 ? s.slice(0, i) : defaultGameId;
   const leg = decodeLeg(i >= 0 ? s.slice(i + 1) : s);
-  return gameId && leg ? { gameId, leg } : null;
+  return GAME_ID_RE.test(gameId) && leg ? { gameId, leg } : null;
 }
 
 export function legLineOk(l: Leg): boolean {
@@ -680,13 +822,80 @@ export interface TicketResult {
   bookDecimal: number | null;
 }
 
+/** Simulacion de todo el ticket: una simulacion por partido, emparejadas por indice (partidos independientes). */
+export interface TicketSim {
+  sims: number;
+  ticket: TicketLeg[];
+  gameIds: string[];
+  /** null si no hay datos del partido */
+  games: (GameSim | null)[];
+  /** posicion de cada seleccion dentro de su partido */
+  legs: { gameIdx: number; localIdx: number }[];
+  /** todas las selecciones disponibles aciertan en la simulacion i */
+  hit: Uint8Array;
+  nActive: number;
+}
+
+export function buildTicketSim(
+  inputsByGame: Record<string, ParlayInputs | undefined>,
+  ticket: TicketLeg[],
+  opts: EvalOptions = {}
+): TicketSim {
+  const sims = opts.sims ?? DEFAULT_SIMS;
+  const seed = opts.seed ?? DEFAULT_SEED;
+  const gameIds: string[] = [];
+  for (const t of ticket) if (!gameIds.includes(t.gameId)) gameIds.push(t.gameId);
+  const games = gameIds.map((gameId) => {
+    const inputs = inputsByGame[gameId];
+    if (!inputs) return null;
+    return simulateGame(inputs, ticket.filter((t) => t.gameId === gameId).map((t) => t.leg), {
+      sims,
+      seed: gameSeed(seed, gameId),
+    });
+  });
+  const counters = gameIds.map(() => 0);
+  const legs = ticket.map((t) => {
+    const gameIdx = gameIds.indexOf(t.gameId);
+    return { gameIdx, localIdx: counters[gameIdx]++ };
+  });
+  const hit = new Uint8Array(sims);
+  const active = games.filter((g): g is GameSim => g != null && g.nActive > 0);
+  const nActive = active.reduce((a, g) => a + g.nActive, 0);
+  if (nActive > 0) {
+    for (let s = 0; s < sims; s++) {
+      let ok = 1;
+      for (const g of active) {
+        if (!g.hit[s]) {
+          ok = 0;
+          break;
+        }
+      }
+      hit[s] = ok;
+    }
+  }
+  return { sims, ticket, gameIds, games, legs, hit, nActive };
+}
+
+/** Aciertos por simulacion de la seleccion `i` del ticket (null si no disponible). */
+export function ticketLegHits(ts: TicketSim, i: number): Uint8Array | null {
+  const { gameIdx, localIdx } = ts.legs[i];
+  return ts.games[gameIdx]?.hits[localIdx] ?? null;
+}
+
+/** Estadistica subyacente simulada de la seleccion `i`. */
+export function ticketLegStat(ts: TicketSim, i: number): Float64Array | null {
+  const { gameIdx, localIdx } = ts.legs[i];
+  return ts.games[gameIdx]?.stats[localIdx] ?? null;
+}
+
 /** Evalua un ticket multi-partido: correlacion dentro de cada partido, independencia entre partidos. */
 export function evaluateTicket(
   inputsByGame: Record<string, ParlayInputs | undefined>,
   ticket: TicketLeg[],
   opts: EvalOptions = {}
 ): TicketResult {
-  const sims = opts.sims ?? 20000;
+  const sims = opts.sims ?? DEFAULT_SIMS;
+  const seed = opts.seed ?? DEFAULT_SEED;
   const order: string[] = [];
   for (const t of ticket) if (!order.includes(t.gameId)) order.push(t.gameId);
 
@@ -712,7 +921,7 @@ export function evaluateTicket(
         })),
       };
     }
-    const r = evaluateParlay(inputs, mine.map((t) => t.leg), { sims, seed: opts.seed });
+    const r = evaluateParlay(inputs, mine.map((t) => t.leg), { sims, seed: gameSeed(seed, gameId) });
     const legs = r.legs.map((l, i) => ({ ...l, gameId, key: ticketLegKey(mine[i]) }));
     const n = legs.filter((l) => l.available).length;
     unavailable += legs.length - n;

@@ -9,8 +9,12 @@ import {
   evaluateTicket,
   ticketLegKey,
   decodeAdd,
+  decodeTicketLeg,
+  GAME_ID_RE,
   decodeLeg,
   evaluateParlay,
+  gameSeed,
+  DEFAULT_SEED,
   hasMarket,
   legKey,
   normCdf,
@@ -160,8 +164,8 @@ describe("ticket multi-partido", () => {
       { gameId: "g1", leg: over("B", 100) },
       { gameId: "g2", leg: win("home") },
     ]);
-    const j1 = evaluateParlay(inputs(0.7), [over("A", 100), over("B", 100)]).joint;
-    const j2 = evaluateParlay(g2(), [win("home")]).joint;
+    const j1 = evaluateParlay(inputs(0.7), [over("A", 100), over("B", 100)], { seed: gameSeed(DEFAULT_SEED, "g1") }).joint;
+    const j2 = evaluateParlay(g2(), [win("home")], { seed: gameSeed(DEFAULT_SEED, "g2") }).joint;
     expect(r.joint).toBeCloseTo(j1 * j2, 12);
     expect(r.games[0].joint).toBeCloseTo(j1, 12);
     expect(r.joint).toBeGreaterThan(r.independent);
@@ -179,15 +183,15 @@ describe("ticket multi-partido", () => {
 
   it("decodifica el formato nuevo y los antiguos", () => {
     const l = over("A", 57.5);
-    const nuevo = decodeTicket({ legs: ["g1~w:home", `g2~${legKey(l)}`] });
-    expect(nuevo.map(ticketLegKey)).toEqual(["g1~w:home", `g2~${legKey(l)}`]);
-    const viejo = decodeTicket({ gameId: "g9", legs: ["w:away", "t:over:47.5"] });
+    const nuevo = decodeTicket({ legs: ["2026_05_BUF_KC~w:home", `2026_05_DEN_LV~${legKey(l)}`] });
+    expect(nuevo.map(ticketLegKey)).toEqual(["2026_05_BUF_KC~w:home", `2026_05_DEN_LV~${legKey(l)}`]);
+    const viejo = decodeTicket({ gameId: "2026_05_BAL_PIT", legs: ["w:away", "t:over:47.5"] });
     expect(viejo).toHaveLength(2);
-    expect(viejo.every((x) => x.gameId === "g9")).toBe(true);
-    const add = decodeTicket({ gameId: "g9", add: ["A:receiving_yards:over:57.5", "B:anytime_td"] });
+    expect(viejo.every((x) => x.gameId === "2026_05_BAL_PIT")).toBe(true);
+    const add = decodeTicket({ gameId: "2026_05_BAL_PIT", add: ["A:receiving_yards:over:57.5", "B:anytime_td"] });
     expect(add).toEqual([
-      { gameId: "g9", leg: l },
-      { gameId: "g9", leg: { kind: "anytime_td", gsis_id: "B" } },
+      { gameId: "2026_05_BAL_PIT", leg: l },
+      { gameId: "2026_05_BAL_PIT", leg: { kind: "anytime_td", gsis_id: "B" } },
     ]);
     expect(decodeTicket({ legs: ["w:home"] })).toEqual([]);
   });
@@ -199,6 +203,34 @@ describe("ticket multi-partido", () => {
     expect(r.ticket).toHaveLength(MAX_GAMES);
     expect(r.error).toBeTruthy();
     expect(addToTicket([], { gameId: "g", leg: { kind: "total", side: "over", line: 5000 } }).ticket).toHaveLength(0);
+  });
+});
+
+describe("validacion de ids y carga de tickets", () => {
+  const G = "2026_05_BUF_KC";
+  it("rechaza ids de partido y de jugador malformados", () => {
+    expect(decodeTicketLeg(`${G}~w:home`)).not.toBeNull();
+    expect(decodeTicketLeg("<b>x</b>~w:home")).toBeNull();
+    expect(decodeTicketLeg("g1~w:home")).toBeNull();
+    expect(decodeTicketLeg("w:home", "evil id")).toBeNull();
+    expect(decodeLeg("p:<script>:receiving_yards:over:5")).toBeNull();
+    expect(decodeLeg("atd:" + "x".repeat(21))).toBeNull();
+    expect(decodeLeg("atd:00-0033873")).not.toBeNull();
+    expect(decodeAdd("a b:receiving_yards:over:5")).toBeNull();
+    expect(GAME_ID_RE.test(G)).toBe(true);
+  });
+  it("reconstruir un ticket con addToTicket aplica limites de partidos, lineas y duplicados", () => {
+    const win = { kind: "winner" as const, team: "home" as const };
+    const mk = (i: number) => ({ gameId: `2026_${String(i + 1).padStart(2, "0")}_BUF_KC`, leg: win });
+    const raw = [
+      ...Array.from({ length: 12 }, (_, i) => mk(i)),
+      mk(0),
+      { gameId: G, leg: { kind: "total" as const, side: "over" as const, line: 5000 } },
+    ];
+    const t = raw.reduce<ReturnType<typeof decodeTicket>>((acc, l) => addToTicket(acc, l).ticket, []);
+    expect(new Set(t.map((x) => x.gameId)).size).toBe(MAX_GAMES);
+    expect(t).toHaveLength(MAX_GAMES);
+    expect(t.some((x) => x.leg.kind === "total")).toBe(false);
   });
 });
 
