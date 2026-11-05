@@ -1,6 +1,6 @@
 # Datos y artefactos generados
-data/
-!data/.gitkeep
+/data/
+!/data/.gitkeep
 *.duckdb
 *.duckdb.wal
 mlruns/

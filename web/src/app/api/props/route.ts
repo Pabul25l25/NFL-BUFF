@@ -1,10 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSql } from "@/lib/db";
+import { PROP_TARGETS, CACHE_5MIN, serverError } from "@/lib/api";
 
-const TARGETS = [
-  "receiving_yards", "rushing_yards", "receptions", "receiving_tds",
-  "rushing_tds", "passing_yards", "passing_tds", "sacks_suffered",
-];
+const TARGETS = PROP_TARGETS;
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -48,6 +46,7 @@ export async function GET(req: NextRequest) {
   }
 
   const query = `
+    SELECT * FROM (
     SELECT game_id, gsis_id, target, point_estimate, lower_80, upper_80,
            explanation_es, shap_values, predicted_at, as_of_ts, season, week,
            home_team, away_team, kickoff_utc, player_name, position, team,
@@ -56,10 +55,16 @@ export async function GET(req: NextRequest) {
            rushing_tds, passing_yards, passing_tds, sacks_suffered
     FROM pub_predictions_props
     WHERE ${conditions.join(" AND ")}
-    ORDER BY point_estimate DESC
+    ORDER BY kickoff_utc DESC, point_estimate DESC
     LIMIT 3000
+    ) t
+    ORDER BY point_estimate DESC
   `;
 
-  const rows = await getSql().query(query, params);
-  return NextResponse.json({ props: rows });
+  try {
+    const rows = await getSql().query(query, params);
+    return NextResponse.json({ props: rows }, { headers: { "Cache-Control": CACHE_5MIN } });
+  } catch {
+    return serverError();
+  }
 }

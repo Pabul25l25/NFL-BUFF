@@ -1,7 +1,8 @@
-import { NextResponse } from "next/server";
 import { getSql } from "@/lib/db";
+import { ok, serverError } from "@/lib/api";
 
 export async function GET() {
+  try {
   const sql = getSql();
   // Subconsulta en una sola sentencia en vez de round-tripear el timestamp
   // maximo por JS: convertirlo a string y pasarlo de vuelta como parametro
@@ -10,7 +11,8 @@ export async function GET() {
     `SELECT feature_name, psi, kl_divergence, reference_mean, current_mean, is_drifted
      FROM drift_metrics
      WHERE checked_at = (SELECT max(checked_at) FROM drift_metrics)
-     ORDER BY psi DESC`
+     ORDER BY psi DESC
+     LIMIT 500`
   );
 
   const checkedAtRows = await sql.query(
@@ -18,5 +20,8 @@ export async function GET() {
   );
   const checkedAt = (checkedAtRows as { checked_at: string | null }[])[0]?.checked_at ?? null;
 
-  return NextResponse.json({ checked_at: checkedAt, features });
+  return ok({ checked_at: checkedAt, features });
+  } catch {
+    return serverError();
+  }
 }

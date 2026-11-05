@@ -12,6 +12,7 @@ consultas; las diferencias inevitables se aíslan aquí.
 
 from __future__ import annotations
 
+import re
 import threading
 import uuid
 from collections.abc import Iterator, Sequence
@@ -53,6 +54,77 @@ def _safe_chunksize(n_columns: int) -> int:
     return max(1, (_POSTGRES_MAX_PARAMS // 2) // max(n_columns, 1))
 
 log = get_logger(__name__)
+
+# Identificadores SQL (tablas/columnas) que se interpolan en el texto de una
+# sentencia: nunca pueden enlazarse como parámetro, así que se validan contra
+# esta expresión antes de usarlos.
+_IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def validate_identifier(name: str) -> str:
+    """Devuelve ``name`` si es un identificador SQL seguro; si no, ValueError."""
+    if not isinstance(name, str) or not _IDENTIFIER_RE.fullmatch(name):
+        raise ValueError(f"Identificador SQL no válido: {name!r}")
+    return name
+
+
+def _qmark_to_named(sql: str, n_params: int) -> str:
+    """Reescribe los ``?`` posicionales como ``:_p0``, ``:_p1``... para `text()`.
+
+    El SQL del proyecto usa ``?`` (estilo nativo de DuckDB) como marcador
+    portable. SQLAlchemy `text()` solo entiende parámetros nombrados, así que
+    para Postgres se traducen aquí, ignorando los ``?`` dentro de literales
+    entre comillas simples o de comentarios ``-- ...``.
+    """
+    out: list[str] = []
+    index = 0
+    in_string = False
+    in_comment = False
+    for i, char in enumerate(sql):
+        if in_comment:
+            out.append(char)
+            if char == "\n":
+                in_comment = False
+        elif char == "'":
+            in_string = not in_string
+            out.append(char)
+        elif not in_string and char == "-" and sql[i + 1 : i + 2] == "-":
+            in_comment = True
+            out.append(char)
+        elif char == "?" and not in_string:
+            out.append(f":_p{index}")
+            index += 1
+        else:
+            out.append(char)
+    if index != n_params:
+        raise ValueError(
+            f"La sentencia tiene {index} marcadores '?' pero se pasaron {n_params} parámetros."
+        )
+    return "".join(out)
+
+
+def _bind_postgres(sql: str, params: Any) -> tuple[str, dict[str, Any]]:
+    """Normaliza (sql, params) al estilo nombrado que espera SQLAlchemy `text()`."""
+    if not params:
+        return sql, {}
+    if isinstance(params, dict):
+        return sql, dict(params)
+    values = list(params)
+    return _qmark_to_named(sql, len(values)), {f"_p{i}": v for i, v in enumerate(values)}
+
+
+def _bind_duckdb(sql: str, params: Any) -> tuple[str, Any]:
+    """Normaliza (sql, params) para DuckDB: ``?`` + lista, o ``$nombre`` + dict."""
+    if not params:
+        return sql, None
+    if isinstance(params, dict):
+        # Acepta el mismo estilo `:nombre` que Postgres y lo traduce a `$nombre`
+        # (sin tocar los casts `::tipo`).
+        for key in params:
+            sql = re.sub(rf"(?<![:\w]):{re.escape(key)}\b", f"${key}", sql)
+        return sql, dict(params)
+    return sql, list(params)
+
 
 # DuckDB no admite dos conexiones de escritura al mismo fichero desde procesos
 # distintos; dentro del proceso serializamos las escrituras con este lock.
@@ -104,17 +176,28 @@ class Database:
 
     # ------------------------------------------------------------------ lectura
 
-    def query(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
-        """Ejecuta una consulta y devuelve un DataFrame."""
+    def query(
+        self, sql: str, params: Sequence[Any] | dict[str, Any] | None = None
+    ) -> pd.DataFrame:
+        """Ejecuta una consulta y devuelve un DataFrame.
+
+        ``params`` se enlaza siempre como parámetro, nunca se interpola. El
+        estilo portable es ``?`` posicional con una lista (funciona igual en
+        DuckDB y en Postgres); también se acepta ``:nombre`` con un dict.
+        """
         with self.connect(read_only=False) as conn:
             if self.backend == "duckdb":
-                result = conn.execute(sql, list(params) if params else None)
+                bound_sql, bound = _bind_duckdb(sql, params)
+                result = conn.execute(bound_sql, bound)
                 return result.fetch_df()
             from sqlalchemy import text
 
-            return pd.read_sql(text(sql), conn, params=params)
+            bound_sql, bound = _bind_postgres(sql, params)
+            return pd.read_sql(text(bound_sql), conn, params=bound)
 
-    def scalar(self, sql: str, params: Sequence[Any] | None = None) -> Any:
+    def scalar(
+        self, sql: str, params: Sequence[Any] | dict[str, Any] | None = None
+    ) -> Any:
         """Devuelve el primer valor de la primera fila, o None.
 
         Normaliza los nulos de pandas (``pd.NA``, ``NaT``, ``NaN``) a ``None``:
@@ -128,16 +211,8 @@ class Database:
         return None if pd.isna(value) else value
 
     def table_exists(self, table: str) -> bool:
-        if self.backend != "duckdb":
-            # Estilo de parámetro propio de SQLAlchemy (`:t`), no el `%(t)s` de
-            # psycopg2 a mano: `text()` lo traduce él mismo al paramstyle real
-            # del driver activo (psycopg v3 aquí). Escribir `%(t)s` directamente
-            # deja pasar un `%` literal que el driver no sabe interpretar.
-            sql = (
-                "SELECT count(*) FROM information_schema.tables "
-                "WHERE table_name = :t AND table_schema NOT IN ('pg_catalog','information_schema')"
-            )
-            return bool(self.scalar(sql, {"t": table}))  # type: ignore[arg-type]
+        # `?` se traduce al estilo nombrado de SQLAlchemy (`:_p0`) para Postgres
+        # en `_bind_postgres`; nunca se escribe `%(t)s` de psycopg a mano.
         sql = (
             "SELECT count(*) FROM information_schema.tables "
             "WHERE table_name = ? AND table_schema NOT IN ('pg_catalog','information_schema')"
@@ -147,19 +222,23 @@ class Database:
     def row_count(self, table: str) -> int:
         if not self.table_exists(table):
             return 0
-        return int(self.scalar(f"SELECT count(*) FROM {table}") or 0)
+        return int(self.scalar(f"SELECT count(*) FROM {validate_identifier(table)}") or 0)
 
     # ------------------------------------------------------------------ escritura
 
-    def execute(self, sql: str, params: Sequence[Any] | None = None) -> None:
-        """Ejecuta una sentencia sin resultado."""
+    def execute(
+        self, sql: str, params: Sequence[Any] | dict[str, Any] | None = None
+    ) -> None:
+        """Ejecuta una sentencia sin resultado (mismos estilos de parámetro que `query`)."""
         with _WRITE_LOCK, self.connect() as conn:
             if self.backend == "duckdb":
-                conn.execute(sql, list(params) if params else None)
+                bound_sql, bound = _bind_duckdb(sql, params)
+                conn.execute(bound_sql, bound)
             else:
                 from sqlalchemy import text
 
-                conn.execute(text(sql), params or {})
+                bound_sql, bound = _bind_postgres(sql, params)
+                conn.execute(text(bound_sql), bound)
                 conn.commit()
 
     def execute_script(self, sql: str) -> None:
@@ -199,6 +278,11 @@ class Database:
 
         if mode == "upsert" and not key_columns:
             raise ValueError("El modo 'upsert' requiere key_columns.")
+
+        # Tabla y claves se interpolan en el SQL: validarlas como identificadores.
+        validate_identifier(table)
+        for key in key_columns or ():
+            validate_identifier(key)
 
         # Alineamos el DataFrame al esquema real de la tabla: solo columnas
         # existentes y en el orden correcto. Esto evita fallos cuando nflverse
@@ -277,7 +361,8 @@ class Database:
             return []
         df = self.query(
             "SELECT column_name FROM information_schema.columns "
-            f"WHERE table_name = '{table}' ORDER BY ordinal_position"
+            "WHERE table_name = ? ORDER BY ordinal_position",
+            [table],
         )
         return df["column_name"].tolist()
 

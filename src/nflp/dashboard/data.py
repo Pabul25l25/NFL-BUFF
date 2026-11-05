@@ -14,15 +14,15 @@ import pandas as pd
 import streamlit as st
 
 from nflp.core.config import get_settings
-from nflp.core.db import get_db
+from nflp.core.db import get_db, validate_identifier
 
 CACHE_TTL = 300  # segundos
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def query(sql: str) -> pd.DataFrame:
-    """Ejecuta una consulta cacheada."""
-    return get_db().query(sql)
+def query(sql: str, params: tuple | None = None) -> pd.DataFrame:
+    """Ejecuta una consulta cacheada con parámetros enlazados (``?``)."""
+    return get_db().query(sql, list(params) if params else None)
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
@@ -33,13 +33,17 @@ def load_predictions(
     team: str | None = None,
 ) -> pd.DataFrame:
     """Predicciones con su resultado real cuando el partido ya se jugó."""
-    clauses = [f"p.target = '{target}'", "p.is_shadow = FALSE"]
+    clauses = ["p.target = ?", "p.is_shadow = FALSE"]
+    params: list = [target]
     if season is not None:
-        clauses.append(f"g.season = {season}")
+        clauses.append("g.season = ?")
+        params.append(int(season))
     if week is not None:
-        clauses.append(f"g.week = {week}")
+        clauses.append("g.week = ?")
+        params.append(int(week))
     if team:
-        clauses.append(f"(g.home_team = '{team}' OR g.away_team = '{team}')")
+        clauses.append("(g.home_team = ? OR g.away_team = ?)")
+        params.extend([team, team])
 
     return query(
         f"""
@@ -66,7 +70,8 @@ def load_predictions(
             PARTITION BY p.game_id ORDER BY p.predicted_at DESC
         ) = 1
         ORDER BY g.kickoff_utc
-        """
+        """,
+        tuple(params),
     )
 
 
@@ -89,13 +94,17 @@ def load_prop_predictions(
     target: str, season: int | None = None, week: int | None = None
 ) -> pd.DataFrame:
     """Proyecciones de props con el resultado real si ya se jugó."""
-    clauses = [f"p.target = '{target}'", "p.gsis_id IS NOT NULL"]
+    clauses = ["p.target = ?", "p.gsis_id IS NOT NULL"]
+    params: list = [target]
     if season is not None:
-        clauses.append(f"g.season = {season}")
+        clauses.append("g.season = ?")
+        params.append(int(season))
     if week is not None:
-        clauses.append(f"g.week = {week}")
+        clauses.append("g.week = ?")
+        params.append(int(week))
 
-    actual_column = _PROP_ACTUAL_COLUMN.get(target, target)
+    # Nombre de columna: no puede enlazarse, así que se valida como identificador.
+    actual_column = validate_identifier(_PROP_ACTUAL_COLUMN.get(target, target))
 
     return query(
         f"""
@@ -126,7 +135,8 @@ def load_prop_predictions(
             PARTITION BY p.game_id, p.gsis_id ORDER BY p.predicted_at DESC
         ) = 1
         ORDER BY p.point_estimate DESC
-        """
+        """,
+        tuple(params),
     )
 
 
@@ -148,27 +158,29 @@ def load_model_registry() -> pd.DataFrame:
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_backtest_results(target: str | None = None) -> pd.DataFrame:
     """Resultados del backtest más reciente."""
-    clause = f"AND target = '{target}'" if target else ""
+    clause = "AND target = ?" if target else ""
     run_id = get_db().scalar(
         f"SELECT run_id FROM backtest_results WHERE 1=1 {clause} "
-        "ORDER BY created_at DESC LIMIT 1"
+        "ORDER BY created_at DESC LIMIT 1",
+        [target] if target else None,
     )
     if not run_id:
         return pd.DataFrame()
-    return query(f"SELECT * FROM backtest_results WHERE run_id = '{run_id}'")
+    return query("SELECT * FROM backtest_results WHERE run_id = ?", (run_id,))
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_calibration(target: str) -> pd.DataFrame:
     """Puntos de la curva de calibración de la última corrida."""
     run_id = get_db().scalar(
-        f"SELECT run_id FROM calibration_bins WHERE target = '{target}' LIMIT 1"
+        "SELECT run_id FROM calibration_bins WHERE target = ? LIMIT 1", [target]
     )
     if not run_id:
         return pd.DataFrame()
     return query(
-        f"SELECT * FROM calibration_bins WHERE run_id = '{run_id}' AND target = '{target}' "
-        "ORDER BY model_label, bin_index"
+        "SELECT * FROM calibration_bins WHERE run_id = ? AND target = ? "
+        "ORDER BY model_label, bin_index",
+        (run_id, target),
     )
 
 
@@ -176,13 +188,14 @@ def load_calibration(target: str) -> pd.DataFrame:
 def load_production_performance(target: str) -> pd.DataFrame:
     """Rendimiento semanal del modelo en producción."""
     return query(
-        f"""
+        """
         SELECT pp.*, r.version, r.family
         FROM production_performance pp
         LEFT JOIN model_registry r ON r.model_id = pp.model_id
-        WHERE pp.target = '{target}'
+        WHERE pp.target = ?
         ORDER BY pp.season, pp.week
-        """
+        """,
+        (target,),
     )
 
 
@@ -193,8 +206,8 @@ def load_drift() -> pd.DataFrame:
     if checked_at is None:
         return pd.DataFrame()
     return query(
-        f"SELECT * FROM drift_metrics WHERE checked_at = '{checked_at}' "
-        "ORDER BY psi DESC"
+        "SELECT * FROM drift_metrics WHERE checked_at = ? ORDER BY psi DESC",
+        (checked_at,),
     )
 
 
@@ -202,10 +215,11 @@ def load_drift() -> pd.DataFrame:
 def load_retraining_log(limit: int = 50) -> pd.DataFrame:
     """Bitácora de decisiones del agente de monitoreo."""
     return query(
-        f"""
-        SELECT occurred_at, target, action, model_id, previous_model_id, reason
-        FROM retraining_log ORDER BY occurred_at DESC LIMIT {limit}
         """
+        SELECT occurred_at, target, action, model_id, previous_model_id, reason
+        FROM retraining_log ORDER BY occurred_at DESC LIMIT ?
+        """,
+        (int(limit),),
     )
 
 

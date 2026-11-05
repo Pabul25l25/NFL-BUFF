@@ -22,10 +22,10 @@ services:
     container_name: nflp-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-nflp}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nflp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en .env}
       POSTGRES_DB: ${POSTGRES_DB:-nflp}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -45,7 +45,7 @@ services:
       --host 0.0.0.0
       --port 5000
     ports:
-      - "${MLFLOW_PORT:-5000}:5000"
+      - "127.0.0.1:${MLFLOW_PORT:-5000}:5000"
     volumes:
       - mlflow_data:/mlflow
     healthcheck:
@@ -65,7 +65,7 @@ services:
       PREFECT_API_URL: http://localhost:${PREFECT_PORT:-4200}/api
       PREFECT_SERVER_API_HOST: 0.0.0.0
     ports:
-      - "${PREFECT_PORT:-4200}:4200"
+      - "127.0.0.1:${PREFECT_PORT:-4200}:4200"
     volumes:
       - prefect_data:/root/.prefect
     restart: unless-stopped
@@ -79,12 +79,12 @@ services:
       # Por defecto se usa DuckDB sobre el volumen compartido. Para usar
       # PostgreSQL, descomenta las dos líneas siguientes.
       # NFLP_DATABASE__BACKEND: postgresql
-      # NFLP_DATABASE__POSTGRES_URL: postgresql+psycopg://nflp:nflp@postgres:5432/nflp
+      # NFLP_DATABASE__POSTGRES_URL: postgresql+psycopg://nflp:<password>@postgres:5432/nflp
       NFLP_MLFLOW__TRACKING_URI: http://mlflow:5000
       PREFECT_API_URL: http://prefect:4200/api
       GIT_PYTHON_REFRESH: quiet
     ports:
-      - "${DASHBOARD_PORT:-8501}:8501"
+      - "127.0.0.1:${DASHBOARD_PORT:-8501}:8501"
     volumes:
       - nflp_data:/app/data
     depends_on:

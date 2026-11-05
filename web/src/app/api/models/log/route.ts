@@ -1,7 +1,8 @@
-import { NextResponse } from "next/server";
 import { getSql } from "@/lib/db";
+import { ok, serverError } from "@/lib/api";
 
 export async function GET() {
+  try {
   const rows = await getSql().query(
     `SELECT occurred_at, target, action, model_id, previous_model_id, reason
      FROM retraining_log
@@ -9,5 +10,8 @@ export async function GET() {
      LIMIT 50`
   );
 
-  return NextResponse.json({ log: rows });
+  return ok({ log: rows });
+  } catch {
+    return serverError();
+  }
 }

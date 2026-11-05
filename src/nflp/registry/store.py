@@ -29,7 +29,7 @@ from typing import Any
 import joblib
 import pandas as pd
 
-from nflp.core.config import Settings, get_settings
+from nflp.core.config import Settings, get_settings, project_root
 from nflp.core.db import Database, get_db
 from nflp.core.logging import get_logger
 
@@ -119,7 +119,7 @@ class ModelRegistry:
 
     def next_version(self, target: str) -> int:
         current = self.db.scalar(
-            f"SELECT max(version) FROM model_registry WHERE target = '{target}'"
+            "SELECT max(version) FROM model_registry WHERE target = ?", [target]
         )
         return int(current or 0) + 1
 
@@ -263,7 +263,8 @@ class ModelRegistry:
     def promote(self, model_id: str, *, reason: str = "promoción manual") -> bool:
         """Promueve un modelo a producción y archiva el anterior."""
         info = self.db.query(
-            f"SELECT target, status, version FROM model_registry WHERE model_id = '{model_id}'"
+            "SELECT target, status, version FROM model_registry WHERE model_id = ?",
+            [model_id],
         )
         if info.empty:
             log.error("Modelo no encontrado: %s", model_id)
@@ -304,11 +305,12 @@ class ModelRegistry:
     def rollback(self, target: str, *, reason: str = "rollback manual") -> str | None:
         """Vuelve a la versión anterior de producción."""
         candidates = self.db.query(
-            f"""
-            SELECT model_id, version FROM model_registry
-            WHERE target = '{target}' AND status = 'archived'
-            ORDER BY version DESC LIMIT 1
             """
+            SELECT model_id, version FROM model_registry
+            WHERE target = ? AND status = 'archived'
+            ORDER BY version DESC LIMIT 1
+            """,
+            [target],
         )
         if candidates.empty:
             log.error("No hay versión archivada a la que volver para '%s'.", target)
@@ -339,25 +341,27 @@ class ModelRegistry:
 
     def current_production(self, target: str) -> str | None:
         result = self.db.scalar(
-            f"SELECT model_id FROM model_registry "
-            f"WHERE target = '{target}' AND status = 'production' "
-            f"ORDER BY version DESC LIMIT 1"
+            "SELECT model_id FROM model_registry "
+            "WHERE target = ? AND status = 'production' "
+            "ORDER BY version DESC LIMIT 1",
+            [target],
         )
         return str(result) if result else None
 
     def current_shadow(self, target: str) -> str | None:
         result = self.db.scalar(
-            f"SELECT model_id FROM model_registry "
-            f"WHERE target = '{target}' AND status = 'shadow' "
-            f"ORDER BY version DESC LIMIT 1"
+            "SELECT model_id FROM model_registry "
+            "WHERE target = ? AND status = 'shadow' "
+            "ORDER BY version DESC LIMIT 1",
+            [target],
         )
         return str(result) if result else None
 
     def get(self, model_id: str) -> pd.DataFrame:
-        return self.db.query(f"SELECT * FROM model_registry WHERE model_id = '{model_id}'")
+        return self.db.query("SELECT * FROM model_registry WHERE model_id = ?", [model_id])
 
     def list_models(self, target: str | None = None) -> pd.DataFrame:
-        clause = f"WHERE target = '{target}'" if target else ""
+        clause = "WHERE target = ?" if target else ""
         return self.db.query(
             f"""
             SELECT model_id, target, family, version, status, metric_name,
@@ -365,17 +369,18 @@ class ModelRegistry:
                    promotion_blocked_reason, created_at, promoted_at
             FROM model_registry {clause}
             ORDER BY target, version DESC
-            """
+            """,
+            [target] if target else None,
         )
 
     def load(self, model_id: str) -> dict[str, Any]:
         """Carga el artefacto serializado de un modelo."""
         path = self.db.scalar(
-            f"SELECT artifact_path FROM model_registry WHERE model_id = '{model_id}'"
+            "SELECT artifact_path FROM model_registry WHERE model_id = ?", [model_id]
         )
         if not path:
             raise FileNotFoundError(f"Sin artefacto registrado para {model_id}")
-        return load_model_artifact(Path(str(path)))
+        return load_model_artifact(Path(str(path)), settings=self.settings)
 
     def load_production(self, target: str) -> tuple[str, dict[str, Any]] | None:
         model_id = self.current_production(target)
@@ -427,11 +432,31 @@ class ModelRegistry:
         self.db.write_df(entry, "retraining_log", mode="append")
 
 
-def load_model_artifact(path: Path) -> dict[str, Any]:
-    """Carga un artefacto joblib desde disco."""
-    if not path.exists():
-        raise FileNotFoundError(f"Artefacto no encontrado: {path}")
-    return joblib.load(path)
+def allowed_artifact_roots(settings: Settings | None = None) -> list[Path]:
+    """Directorios desde los que se permite deserializar artefactos.
+
+    `joblib.load` ejecuta código arbitrario si el fichero es malicioso, así que
+    la ruta guardada en ``model_registry.artifact_path`` nunca se carga a
+    ciegas: tiene que caer dentro del directorio de artefactos configurado o
+    del store de artefactos local de MLflow (``mlruns``).
+    """
+    settings = settings or get_settings()
+    roots = [settings.paths.artifacts_dir, project_root() / "mlruns"]
+    return [Path(r).resolve() for r in roots]
+
+
+def load_model_artifact(path: Path, *, settings: Settings | None = None) -> dict[str, Any]:
+    """Carga un artefacto joblib desde disco, solo si está en un directorio permitido."""
+    resolved = Path(path).resolve()
+    roots = allowed_artifact_roots(settings)
+    if not any(resolved.is_relative_to(root) for root in roots):
+        raise PermissionError(
+            f"Artefacto fuera de los directorios permitidos ({', '.join(map(str, roots))}): "
+            f"{resolved}"
+        )
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Artefacto no encontrado: {resolved}")
+    return joblib.load(resolved)
 
 
 def _jsonable(value: Any) -> Any:

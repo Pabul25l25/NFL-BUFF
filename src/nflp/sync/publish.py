@@ -27,7 +27,7 @@ from datetime import UTC, datetime
 import pandas as pd
 
 from nflp.core.config import DatabaseConfig, Settings, get_settings
-from nflp.core.db import Database, get_db
+from nflp.core.db import Database, get_db, validate_identifier
 from nflp.core.logging import get_logger
 
 log = get_logger(__name__)
@@ -236,6 +236,8 @@ def _publish_plain_tables(
         if not local.table_exists(table):
             log.debug("Tabla local '%s' no existe todavía; se omite.", table)
             continue
+        # Los nombres vienen de configuración: se validan antes de interpolarlos.
+        validate_identifier(table)
         frame = local.query(f"SELECT * FROM {table}")
         rows = cloud.write_df(frame, table, mode="replace")
         report.add(table, rows)
@@ -247,7 +249,7 @@ def _publish_games_and_predictions(
 ) -> None:
     """Calendario completo y todas las predicciones, vía upsert."""
     for table in ("games", "predictions"):
-        frame = local.query(f"SELECT * FROM {table}")
+        frame = local.query(f"SELECT * FROM {validate_identifier(table)}")
         rows = cloud.write_df(frame, table, mode="upsert", key_columns=_UPSERT_KEYS[table])
         report.add(table, rows)
         log.debug("Publicado '%s': %d filas (upsert).", table, rows)
@@ -267,7 +269,7 @@ def _publish_recent_player_data(
     min_season = int(max_season) - recent_seasons + 1
 
     stats = local.query(
-        f"SELECT * FROM player_stats_weekly WHERE season >= {min_season}"
+        "SELECT * FROM player_stats_weekly WHERE season >= ?", [min_season]
     )
     rows = cloud.write_df(
         stats, "player_stats_weekly", mode="upsert",
@@ -276,10 +278,11 @@ def _publish_recent_player_data(
     report.add("player_stats_weekly", rows)
 
     weather = local.query(
-        f"""
-        SELECT w.* FROM weather w JOIN games g USING (game_id)
-        WHERE g.season >= {min_season}
         """
+        SELECT w.* FROM weather w JOIN games g USING (game_id)
+        WHERE g.season >= ?
+        """,
+        [min_season],
     )
     rows = cloud.write_df(weather, "weather", mode="upsert", key_columns=_UPSERT_KEYS["weather"])
     report.add("weather", rows)

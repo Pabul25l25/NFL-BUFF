@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSql } from "@/lib/db";
 import { GAME_ID_RE } from "@/lib/parlay";
+import { CACHE_5MIN, serverError } from "@/lib/api";
 
 
 /** Las columnas JSON se publican como VARCHAR; el driver puede devolverlas ya parseadas. */
@@ -21,6 +22,14 @@ function num(value: unknown): number | null {
 }
 
 export async function GET(req: NextRequest) {
+  try {
+    return await handle(req);
+  } catch {
+    return serverError();
+  }
+}
+
+async function handle(req: NextRequest) {
   const gameId = new URL(req.url).searchParams.get("game_id") ?? "";
   if (!GAME_ID_RE.test(gameId)) {
     return NextResponse.json({ error: "game_id invalido" }, { status: 400 });
@@ -123,5 +132,5 @@ export async function GET(req: NextRequest) {
     markets,
     corr,
     calibration,
-  });
+  }, { headers: { "Cache-Control": CACHE_5MIN } });
 }

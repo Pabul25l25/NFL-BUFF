@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSql } from "@/lib/db";
 import { GAME_ID_RE } from "@/lib/parlay";
+import { serverError } from "@/lib/api";
 import type { TicketResultsResponse } from "@/lib/ticket-results-types";
 
 const MAX_IDS = 10;
@@ -12,6 +13,14 @@ function num(value: unknown): number | null {
 }
 
 export async function GET(req: NextRequest) {
+  try {
+    return await handle(req);
+  } catch {
+    return serverError();
+  }
+}
+
+async function handle(req: NextRequest) {
   const raw = new URL(req.url).searchParams.get("game_ids") ?? "";
   const ids = Array.from(new Set(raw.split(",").map((s) => s.trim())));
   if (ids.length < 1 || ids.length > MAX_IDS || !ids.every((id) => GAME_ID_RE.test(id))) {
