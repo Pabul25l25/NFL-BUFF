@@ -37,5 +37,5 @@ Si la tarea cruza dominios (por ejemplo, una columna nueva que va de `features-a
 - Nunca escribir cadenas de conexión, contraseñas o tokens en archivos del repo ni en mensajes de commit. Solo en variables de entorno o en `web/.env.local` (ignorado por git).
 - La web usa un rol de Postgres de solo lectura. Las rutas `/api` solo ejecutan SELECT con parámetros enlazados.
 - Validación siempre temporal (walk-forward). Sin splits aleatorios. Sin features que usen el resultado del partido o líneas de mercado.
-- Los commits terminan con `Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>`.
+- Los commits van solo a nombre del dueño del repo: sin línea `Co-Authored-By` ni ninguna otra atribución a Claude o a agentes, en mensajes de commit ni en PRs.
 - Antes de desplegar a producción: `npm run build` limpio y verificación en vivo con curl.
